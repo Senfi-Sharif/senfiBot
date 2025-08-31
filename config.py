@@ -16,11 +16,18 @@ class Config:
     
     # Role Configuration - User IDs for each role (individual accounts)
     ROLE_USERS = {
-        'ROLE_SECRETARY_USER_ID': os.getenv('ROLE_SECRETARY_USER_ID'),      # دبیر
-        'ROLE_LEGAL_USER_ID': os.getenv('ROLE_LEGAL_USER_ID'),              # نائب دبیر/مسئول حقوقی
-        'ROLE_EDUCATIONAL_1_USER_ID': os.getenv('ROLE_EDUCATIONAL_1_USER_ID'), # مسئول آموزش ۱
-        'ROLE_EDUCATIONAL_2_USER_ID': os.getenv('ROLE_EDUCATIONAL_2_USER_ID'), # مسئول آموزش ۲
-        'ROLE_PUBLICATION_USER_ID': os.getenv('ROLE_PUBLICATION_USER_ID'),   # مسئول نشریه
+        'ROLE_SECRETARY_USER_ID': os.getenv('ROLE_SECRETARY_USER_ID'),                    # دبیر: فرزاد رحمانی
+        'ROLE_DEPUTY_SECRETARY_USER_ID': os.getenv('ROLE_DEPUTY_SECRETARY_USER_ID'),      # نائب‌دبیر: میعاد رضایی
+        'ROLE_ORGANIZATION_USER_ID': os.getenv('ROLE_ORGANIZATION_USER_ID'),              # کارگروه سازماندهی: عرفان بیدمشکی
+        'ROLE_EDUCATION_USER_ID': os.getenv('ROLE_EDUCATION_USER_ID'),                    # کارگروه آموزش: علیرضا ناصری
+        'ROLE_LEGAL_USER_ID': os.getenv('ROLE_LEGAL_USER_ID'),                            # کارگروه حقوقی: حسن براتی
+        'ROLE_WOMEN_USER_ID': os.getenv('ROLE_WOMEN_USER_ID'),                            # کارگروه زنان: نرگس کاری
+        'ROLE_NUTRITION_USER_ID': os.getenv('ROLE_NUTRITION_USER_ID'),                    # کارگروه تغذیه: آرین شباهنگ
+        'ROLE_HEALTH_USER_ID': os.getenv('ROLE_HEALTH_USER_ID'),                          # کارگروه سلامت: بهاره حیدری
+        'ROLE_FACILITIES_USER_ID': os.getenv('ROLE_FACILITIES_USER_ID'),                  # کارگروه تاسیسات و خدمات رفاهی: سید رضا رضی
+        'ROLE_DORMITORY_USER_ID': os.getenv('ROLE_DORMITORY_USER_ID'),                    # کارگروه خوابگاه‌ها: مجید محمدی
+        'ROLE_PUBLIC_RELATIONS_USER_ID': os.getenv('ROLE_PUBLIC_RELATIONS_USER_ID'),      # کارگروه روابط عمومی و رویدادها: آرشام برقی
+        'ROLE_PUBLICATION_USER_ID': os.getenv('ROLE_PUBLICATION_USER_ID'),                # نشریه
     }
     
     # Bot Settings

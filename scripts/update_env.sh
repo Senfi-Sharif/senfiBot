@@ -12,11 +12,18 @@ DATABASE_PATH=./bot_database.db
 ADMIN_USER_ID=xxxx
 
 # Role Configuration - Individual User IDs
-ROLE_LEGAL_USER_ID=your_legal_user_id_here
-ROLE_EDUCATIONAL_USER_ID=your_educational_user_id_here
-ROLE_WELFARE_USER_ID=your_welfare_user_id_here
-ROLE_CULTURAL_USER_ID=your_cultural_user_id_here
-ROLE_SPORTS_USER_ID=your_sports_user_id_here
+ROLE_SECRETARY_USER_ID=your_secretary_user_id_here                    # دبیر: فرزاد رحمانی
+ROLE_DEPUTY_SECRETARY_USER_ID=your_deputy_secretary_user_id_here      # نائب‌دبیر: میعاد رضایی
+ROLE_ORGANIZATION_USER_ID=your_organization_user_id_here              # کارگروه سازماندهی: عرفان بیدمشکی
+ROLE_EDUCATION_USER_ID=your_education_user_id_here                    # کارگروه آموزش: علیرضا ناصری
+ROLE_LEGAL_USER_ID=your_legal_user_id_here                            # کارگروه حقوقی: حسن براتی
+ROLE_WOMEN_USER_ID=your_women_user_id_here                            # کارگروه زنان: نرگس کاری
+ROLE_NUTRITION_USER_ID=your_nutrition_user_id_here                    # کارگروه تغذیه: آرین شباهنگ
+ROLE_HEALTH_USER_ID=your_health_user_id_here                          # کارگروه سلامت: بهاره حیدری
+ROLE_FACILITIES_USER_ID=your_facilities_user_id_here                  # کارگروه تاسیسات و خدمات رفاهی: سید رضا رضی
+ROLE_DORMITORY_USER_ID=your_dormitory_user_id_here                    # کارگروه خوابگاه‌ها: مجید محمدی
+ROLE_PUBLIC_RELATIONS_USER_ID=your_public_relations_user_id_here      # کارگروه روابط عمومی و رویدادها: آرشام برقی
+ROLE_PUBLICATION_USER_ID=your_publication_user_id_here                # نشریه
 EOF
 
 # Set correct permissions

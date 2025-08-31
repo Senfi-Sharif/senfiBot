@@ -1396,9 +1396,16 @@ class EnhancedCouncilBot:
         """Check if user is an authorized admin"""
         admin_ids = [
             Config.ROLE_USERS['ROLE_SECRETARY_USER_ID'],
+            Config.ROLE_USERS['ROLE_DEPUTY_SECRETARY_USER_ID'],
+            Config.ROLE_USERS['ROLE_ORGANIZATION_USER_ID'],
+            Config.ROLE_USERS['ROLE_EDUCATION_USER_ID'],
             Config.ROLE_USERS['ROLE_LEGAL_USER_ID'],
-            Config.ROLE_USERS['ROLE_EDUCATIONAL_1_USER_ID'],
-            Config.ROLE_USERS['ROLE_EDUCATIONAL_2_USER_ID'],
+            Config.ROLE_USERS['ROLE_WOMEN_USER_ID'],
+            Config.ROLE_USERS['ROLE_NUTRITION_USER_ID'],
+            Config.ROLE_USERS['ROLE_HEALTH_USER_ID'],
+            Config.ROLE_USERS['ROLE_FACILITIES_USER_ID'],
+            Config.ROLE_USERS['ROLE_DORMITORY_USER_ID'],
+            Config.ROLE_USERS['ROLE_PUBLIC_RELATIONS_USER_ID'],
             Config.ROLE_USERS['ROLE_PUBLICATION_USER_ID'],
             Config.ADMIN_USER_ID
         ]

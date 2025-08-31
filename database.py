@@ -105,10 +105,16 @@ class Database:
         
         role_configs = [
             ('دبیر', 'ROLE_SECRETARY_USER_ID', ''),
-            ('نائب دبیر/مسئول حقوقی', 'ROLE_LEGAL_USER_ID', ''),
-            ('مسئول آموزش ۱', 'ROLE_EDUCATIONAL_1_USER_ID', ''),
-            ('مسئول آموزش ۲', 'ROLE_EDUCATIONAL_2_USER_ID', ''),
-            ('مسئول نشریه', 'ROLE_PUBLICATION_USER_ID', ''),
+            ('نائب‌دبیر', 'ROLE_DEPUTY_SECRETARY_USER_ID', ''),
+            ('کارگروه سازماندهی', 'ROLE_ORGANIZATION_USER_ID', ''),
+            ('کارگروه آموزش', 'ROLE_EDUCATION_USER_ID', ''),
+            ('کارگروه حقوقی', 'ROLE_LEGAL_USER_ID', ''),
+            ('کارگروه زنان', 'ROLE_WOMEN_USER_ID', ''),
+            ('کارگروه تغذیه', 'ROLE_NUTRITION_USER_ID', ''),
+            ('کارگروه سلامت', 'ROLE_HEALTH_USER_ID', ''),
+            ('کارگروه تاسیسات و خدمات رفاهی', 'ROLE_FACILITIES_USER_ID', ''),
+            ('کارگروه خوابگاه‌ها', 'ROLE_DORMITORY_USER_ID', ''),
+            ('کارگروه روابط عمومی و رویدادها', 'ROLE_PUBLIC_RELATIONS_USER_ID', ''),
         ]
         
         for role_name, user_id_key, description in role_configs:
