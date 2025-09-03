@@ -247,7 +247,6 @@ class EnhancedCouncilBot:
         elif query.data == "send_message":
             # Create reply keyboard for typing
             reply_keyboard = [
-                [KeyboardButton("🔙 بازگشت")],
                 [KeyboardButton("🏠 منوی اصلی")]
             ]
             reply_markup_keyboard = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True, one_time_keyboard=False)
@@ -256,7 +255,7 @@ class EnhancedCouncilBot:
             await query.edit_message_text(
                 text="📝 **ارسال پیام**\n\n"
                 "💬 **حالا پیام خود را تایپ کنید:**\n\n"
-                "برای لغو، روی دکمه «🔙 بازگشت» کلیک کنید.",
+                "برای لغو، روی دکمه «🏠 منوی اصلی» کلیک کنید.",
                 parse_mode=ParseMode.MARKDOWN
             )
             
@@ -272,26 +271,36 @@ class EnhancedCouncilBot:
 
         
         elif query.data == "back_to_role":
-            # Go back to role selection for current role
+            # Go back to message mode for current role
             user_id = query.from_user.id
             if user_id in self.user_states:
                 role = self.user_states[user_id]['selected_role']
                 thread_id = self.user_states[user_id].get('thread_id')
                 
                 if thread_id:
-                    keyboard = [
-                        [InlineKeyboardButton("📝 ارسال پیام", callback_data="send_message")],
-                        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_menu")]
+                    # Create reply keyboard for typing
+                    reply_keyboard = [
+                        [KeyboardButton("🏠 منوی اصلی")]
                     ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    reply_markup_keyboard = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True, one_time_keyboard=False)
                     
+                    # Edit the message to show typing interface
                     await query.edit_message_text(
                         text=f"✅ **گفتگو با {role['role_name']}**\n\n"
                         f"🆔 شناسه گفتگو: #{thread_id}\n\n"
-                        f"برای ارسال پیام، روی «📝 ارسال پیام» کلیک کنید.",
-                        reply_markup=reply_markup,
+                        f"💬 **حالا پیام خود را تایپ کنید:**\n\n"
+                        f"برای برگشت به منو، روی دکمه «🏠 منوی اصلی» کلیک کنید.",
                         parse_mode=ParseMode.MARKDOWN
                     )
+                    
+                    # Send a separate message with reply keyboard
+                    await context.bot.send_message(
+                        chat_id=query.from_user.id,
+                        text="⌨️ **دکمه‌های زیر را برای ناوبری استفاده کنید:**",
+                        reply_markup=reply_markup_keyboard,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    return WAITING_FOR_MESSAGE
                 else:
                     await self.show_role_menu(update, context)
                 return CHOOSING_ROLE
@@ -438,40 +447,36 @@ class EnhancedCouncilBot:
             thread_id = self.db.get_active_thread(user_id, role_id)
             if thread_id:
                 self.user_states[user_id]['thread_id'] = thread_id
-                
-                # Show active thread with inline keyboard
-                keyboard = [
-                    [InlineKeyboardButton("📝 ارسال پیام", callback_data="send_message")],
-                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_menu")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    text=f"✅ **گفتگوی فعال یافت شد!**\n\n"
-                    f"مسئول: {role['role_name']}\n"
-                    f"🆔 شناسه گفتگو: #{thread_id}\n\n"
-                    f"برای ارسال پیام، روی «📝 ارسال پیام» کلیک کنید.",
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.MARKDOWN
-                )
             else:
-                # Show new conversation with inline keyboard
-                keyboard = [
-                    [InlineKeyboardButton("📝 ارسال پیام", callback_data="send_message")],
-                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_menu")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    text=f"✅ **مسئول انتخاب شد!**\n\n"
-                    f"مسئول: {role['role_name']}\n\n"
-                    f"برای ارسال پیام، روی «📝 ارسال پیام» کلیک کنید.\n\n"
-                    f"⚠️ توجه: پیام‌ها ناشناس نیستند و اطلاعات شما برای مسئول ارسال می‌شود.",
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                # Create new thread if none exists
+                thread_id = self.db.create_thread(user_id, role_id)
+                self.user_states[user_id]['thread_id'] = thread_id
             
-            return CHOOSING_ROLE
+            # Go directly to message mode
+            # Create reply keyboard for typing
+            reply_keyboard = [
+                [KeyboardButton("🏠 منوی اصلی")]
+            ]
+            reply_markup_keyboard = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True, one_time_keyboard=False)
+            
+            # Edit the message to show typing interface
+            await query.edit_message_text(
+                text=f"✅ **گفتگو با {role['role_name']}**\n\n"
+                f"🆔 شناسه گفتگو: #{thread_id}\n\n"
+                f"💬 **حالا پیام خود را تایپ کنید:**\n\n"
+                f"برای برگشت به منو، روی دکمه «🏠 منوی اصلی» کلیک کنید.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Send a separate message with reply keyboard
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="⌨️ **دکمه‌های زیر را برای ناوبری استفاده کنید:**",
+                reply_markup=reply_markup_keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return WAITING_FOR_MESSAGE
+
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle user messages"""
@@ -508,53 +513,7 @@ class EnhancedCouncilBot:
         message_text = update.message.text
         
         # Handle reply keyboard buttons
-        if message_text == "🔙 بازگشت":
-            # Remove reply keyboard
-            remove_keyboard = ReplyKeyboardRemove()
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🔙 بازگشت به منوی مسئول",
-                reply_markup=remove_keyboard
-            )
-            # Go back to role view - create role view directly
-            user_id = update.effective_user.id
-            if user_id in self.user_states:
-                role = self.user_states[user_id]['selected_role']
-                thread_id = self.user_states[user_id].get('thread_id')
-                
-                if thread_id:
-                    keyboard = [
-                        [InlineKeyboardButton("📝 ارسال پیام", callback_data="send_message")],
-                        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_menu")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"✅ **گفتگو با {role['role_name']}**\n\n"
-                        f"🆔 شناسه گفتگو: #{thread_id}\n\n"
-                        f"برای ارسال پیام، روی «📝 ارسال پیام» کلیک کنید.",
-                        reply_markup=reply_markup,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                else:
-                    keyboard = [
-                        [InlineKeyboardButton("📝 ارسال پیام", callback_data="send_message")],
-                        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_menu")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"✅ **مسئول انتخاب شده**\n\n"
-                        f"مسئول: {role['role_name']}\n\n"
-                        f"برای ارسال پیام، روی «📝 ارسال پیام» کلیک کنید.",
-                        reply_markup=reply_markup,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-            return CHOOSING_ROLE
-        
-        elif message_text == "🏠 منوی اصلی":
+        if message_text == "🏠 منوی اصلی":
             # Remove reply keyboard
             remove_keyboard = ReplyKeyboardRemove()
             await context.bot.send_message(
@@ -652,20 +611,13 @@ class EnhancedCouncilBot:
             # Save the mapping to database for persistence
             self.save_message_mapping(sent_msg.message_id, thread_id)
             
-            # Confirm to user
-            keyboard = [
-                [InlineKeyboardButton("📝 ارسال پیام دیگر", callback_data="send_message")],
-                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_role")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_menu")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
+            # Confirm to user - just show success message without menu
             await update.message.reply_text(
                 f"✅ **پیام شما ارسال شد!**\n\n"
                 f"مسئول: {role['role_name']}\n"
                 f"🆔 شناسه گفتگو: #{thread_id}\n\n"
-                f"پاسخ مسئول به شما ارسال خواهد شد.",
-                reply_markup=reply_markup,
+                f"پاسخ مسئول به شما ارسال خواهد شد.\n"
+                f"💬 **می‌توانید پیام بعدی خود را تایپ کنید.**",
                 parse_mode=ParseMode.MARKDOWN
             )
             
@@ -1322,15 +1274,10 @@ class EnhancedCouncilBot:
         help_text = """
 ❓ **راهنمای استفاده از بات**
 
-**دستورات اصلی:**
-• /start - شروع مجدد بات
-• /cancel - لغو عملیات فعلی
-
 **نحوه استفاده:**
 1. مسئول مورد نظر خود را انتخاب کنید
-2. روی «📝 ارسال پیام» کلیک کنید
-3. پیام خود را تایپ کنید
-4. پیام شما برای مسئول ارسال می‌شود
+2. پیام خود را تایپ کنید
+3. پیام شما برای مسئول ارسال می‌شود
 
 **نکات مهم:**
 • پیام‌ها ناشناس نیستند
