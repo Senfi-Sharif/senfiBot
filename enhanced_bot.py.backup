@@ -45,13 +45,8 @@ class EnhancedCouncilBot:
         self.load_message_mappings()
     
     async def send_to_channel(self, context: ContextTypes.DEFAULT_TYPE, message: str, parse_mode: str = 'HTML'):
-        """Send message to the logging channel (optional - silently fails if channel not available)"""
+        """Send message to the logging channel"""
         try:
-            # Skip channel logging if channel ID is invalid or not configured
-            if not hasattr(self, 'CHANNEL_ID') or not self.CHANNEL_ID or self.CHANNEL_ID == -1001234567890:
-                logger.info("Channel logging disabled - no valid channel configured")
-                return
-            
             await context.bot.send_message(
                 chat_id=self.CHANNEL_ID,
                 text=message,
@@ -59,39 +54,7 @@ class EnhancedCouncilBot:
             )
             logger.info(f"Message sent to channel {self.CHANNEL_ID}")
         except Exception as e:
-            # Silently log channel errors - don't interrupt main functionality
-            logger.info(f"Channel logging unavailable: {e}")
-    
-    async def safe_send_message(self, context, chat_id, text, reply_markup=None, reply_to_message_id=None, parse_mode=None):
-        """Safely send message with fallback for parsing errors"""
-        try:
-            # First try with the specified parse mode
-            return await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode=parse_mode
-            )
-        except Exception as e:
-            if "can't parse entities" in str(e).lower() or "parse" in str(e).lower():
-                # If parsing fails, try without parse mode
-                logger.warning(f"Parsing failed, sending as plain text: {e}")
-                try:
-                    return await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_markup=reply_markup,
-                        reply_to_message_id=reply_to_message_id,
-                        parse_mode=None
-                    )
-                except Exception as e2:
-                    logger.error(f"Failed to send message even as plain text: {e2}")
-                    raise e2
-            else:
-                # Re-raise other errors
-                raise e
-
+            logger.error(f"Error sending message to channel: {e}")
     
     def acquire_lock(self) -> bool:
         """Try to acquire a lock to prevent multiple instances"""
@@ -630,12 +593,11 @@ class EnhancedCouncilBot:
         await self.send_to_channel(context, channel_message)
         
         try:
-            sent_msg = await self.safe_send_message(
-                context,
-                admin_user_id,
-                admin_message,
-                reply_markup=admin_reply_markup,
-                parse_mode=ParseMode.MARKDOWN
+            sent_msg = await context.bot.send_message(
+                chat_id=admin_user_id,
+                text=admin_message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=admin_reply_markup
             )
             
             # Store the mapping between role message and thread
@@ -1001,13 +963,12 @@ class EnhancedCouncilBot:
                     if is_admin:
                         # Admin sending reply to student - use back to menu button
                         back_to_menu_markup = self.create_back_to_menu_button()
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
                             reply_to_message_id=msg_result[0],
-                            reply_markup=back_to_menu_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=back_to_menu_markup
                         )
                     else:
                         # Student sending reply to admin - add block buttons
@@ -1025,24 +986,22 @@ class EnhancedCouncilBot:
                             ]
                         
                         reply_markup = InlineKeyboardMarkup(admin_keyboard)
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
                             reply_to_message_id=msg_result[0],
-                            reply_markup=reply_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=reply_markup
                         )
                 else:
                     if is_admin:
                         # Admin sending reply to student - use back to menu button
                         back_to_menu_markup = self.create_back_to_menu_button()
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
-                            reply_markup=back_to_menu_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=back_to_menu_markup
                         )
                     else:
                         # Student sending reply to admin - add block buttons
@@ -1060,12 +1019,11 @@ class EnhancedCouncilBot:
                             ]
                         
                         reply_markup = InlineKeyboardMarkup(admin_keyboard)
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
-                            reply_markup=reply_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=reply_markup
                         )
                 
                 # Save message mapping for future replies

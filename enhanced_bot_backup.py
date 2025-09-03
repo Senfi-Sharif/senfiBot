@@ -630,12 +630,11 @@ class EnhancedCouncilBot:
         await self.send_to_channel(context, channel_message)
         
         try:
-            sent_msg = await self.safe_send_message(
-                context,
-                admin_user_id,
-                admin_message,
-                reply_markup=admin_reply_markup,
-                parse_mode=ParseMode.MARKDOWN
+            sent_msg = await context.bot.send_message(
+                chat_id=admin_user_id,
+                text=admin_message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=admin_reply_markup
             )
             
             # Store the mapping between role message and thread
@@ -1001,13 +1000,12 @@ class EnhancedCouncilBot:
                     if is_admin:
                         # Admin sending reply to student - use back to menu button
                         back_to_menu_markup = self.create_back_to_menu_button()
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
                             reply_to_message_id=msg_result[0],
-                            reply_markup=back_to_menu_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=back_to_menu_markup
                         )
                     else:
                         # Student sending reply to admin - add block buttons
@@ -1025,24 +1023,22 @@ class EnhancedCouncilBot:
                             ]
                         
                         reply_markup = InlineKeyboardMarkup(admin_keyboard)
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
                             reply_to_message_id=msg_result[0],
-                            reply_markup=reply_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=reply_markup
                         )
                 else:
                     if is_admin:
                         # Admin sending reply to student - use back to menu button
                         back_to_menu_markup = self.create_back_to_menu_button()
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
-                            reply_markup=back_to_menu_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=back_to_menu_markup
                         )
                     else:
                         # Student sending reply to admin - add block buttons
@@ -1060,12 +1056,11 @@ class EnhancedCouncilBot:
                             ]
                         
                         reply_markup = InlineKeyboardMarkup(admin_keyboard)
-                        sent_message = await self.safe_send_message(
-                            context,
-                            target_user_id,
-                            reply_text,
-                            reply_markup=reply_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                        sent_message = await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=reply_text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=reply_markup
                         )
                 
                 # Save message mapping for future replies
