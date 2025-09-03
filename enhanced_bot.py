@@ -933,23 +933,26 @@ class EnhancedCouncilBot:
 برای پاسخ، روی این پیام ریپلای کنید.
                 """
             
-            # Find the original message to reply to
+            # Find the corresponding message in the target chat to reply to
+            # We need to find the message in the target user's chat that corresponds to this thread
             conn = sqlite3.connect(self.db.db_path)
             cursor = conn.cursor()
-            if is_admin:
-                # Find the last user message to reply to
+            
+            if not is_student_reply:
+                # Admin replying to student - find the student's last message in this thread
                 cursor.execute('''
                     SELECT telegram_message_id FROM messages 
                     WHERE thread_id = ? AND sender_type = 'user' 
                     ORDER BY message_id DESC LIMIT 1
                 ''', (thread_id,))
             else:
-                # Find the last admin message to reply to
+                # Student replying to admin - find the admin's last message in this thread
                 cursor.execute('''
                     SELECT telegram_message_id FROM messages 
                     WHERE thread_id = ? AND sender_type = 'admin' 
                     ORDER BY message_id DESC LIMIT 1
                 ''', (thread_id,))
+            
             msg_result = cursor.fetchone()
             conn.close()
             
