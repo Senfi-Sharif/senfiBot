@@ -62,35 +62,54 @@ class EnhancedCouncilBot:
             # Silently log channel errors - don't interrupt main functionality
             logger.info(f"Channel logging unavailable: {e}")
     
-    async def safe_send_message(self, context, chat_id, text, reply_markup=None, reply_to_message_id=None, parse_mode=None):
-        """Safely send message with fallback for parsing errors"""
-        try:
-            # First try with the specified parse mode
-            return await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode=parse_mode
-            )
-        except Exception as e:
-            if "can't parse entities" in str(e).lower() or "parse" in str(e).lower():
-                # If parsing fails, try without parse mode
-                logger.warning(f"Parsing failed, sending as plain text: {e}")
-                try:
-                    return await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_markup=reply_markup,
-                        reply_to_message_id=reply_to_message_id,
-                        parse_mode=None
-                    )
-                except Exception as e2:
-                    logger.error(f"Failed to send message even as plain text: {e2}")
-                    raise e2
-            else:
-                # Re-raise other errors
-                raise e
+    async def safe_send_message(self, context, chat_id, text, reply_markup=None, reply_to_message_id=None, parse_mode=None, max_retries=3):
+        """Safely send message with fallback for parsing errors and network issues"""
+        import asyncio
+        
+        for attempt in range(max_retries):
+            try:
+                # First try with the specified parse mode
+                return await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    reply_to_message_id=reply_to_message_id,
+                    parse_mode=parse_mode
+                )
+            except Exception as e:
+                if "can't parse entities" in str(e).lower() or "parse" in str(e).lower():
+                    # If parsing fails, try without parse mode
+                    logger.warning(f"Parsing failed, trying without parse mode: {e}")
+                    try:
+                        return await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=text,
+                            reply_markup=reply_markup,
+                            reply_to_message_id=reply_to_message_id,
+                            parse_mode=None
+                        )
+                    except Exception as e2:
+                        logger.error(f"Failed to send message even as plain text: {e2}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                            continue
+                        raise e2
+                elif "connect" in str(e).lower() or "timeout" in str(e).lower() or "network" in str(e).lower() or "timed out" in str(e).lower():
+                    # Network error or timeout - retry with backoff
+                    logger.warning(f"Network/timeout error on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                    else:
+                        logger.error(f"Network/timeout error after {max_retries} attempts: {e}")
+                        raise e
+                else:
+                    # Other errors
+                    logger.error(f"Unexpected error: {e}")
+                    raise e
+        
+        # This shouldn't be reached, but just in case
+        raise Exception("Max retries exceeded")
 
     
     def acquire_lock(self) -> bool:
@@ -262,7 +281,7 @@ class EnhancedCouncilBot:
             # Send a separate message with reply keyboard
             await context.bot.send_message(
                 chat_id=query.from_user.id,
-                text="⌨️ **دکمه‌های زیر را برای ناوبری استفاده کنید:**",
+                text="⌨️ **پیام خود را ارسال نمایید:**",
                 reply_markup=reply_markup_keyboard,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -296,7 +315,7 @@ class EnhancedCouncilBot:
                     # Send a separate message with reply keyboard
                     await context.bot.send_message(
                         chat_id=query.from_user.id,
-                        text="⌨️ **دکمه‌های زیر را برای ناوبری استفاده کنید:**",
+                        text="⌨️ **پیام خود را ارسال نمایید:**",
                         reply_markup=reply_markup_keyboard,
                         parse_mode=ParseMode.MARKDOWN
                     )
@@ -471,7 +490,7 @@ class EnhancedCouncilBot:
             # Send a separate message with reply keyboard
             await context.bot.send_message(
                 chat_id=query.from_user.id,
-                text="⌨️ **دکمه‌های زیر را برای ناوبری استفاده کنید:**",
+                text="⌨️ **پیام خود را ارسال نمایید:**",
                 reply_markup=reply_markup_keyboard,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -742,17 +761,30 @@ class EnhancedCouncilBot:
                 
                 # 5. Last resort: try to find any recent message in the same chat
                 if not result:
-                    cursor.execute('''
-                        SELECT thread_id FROM messages 
-                        WHERE telegram_message_id IN (
-                            SELECT telegram_message_id FROM messages 
-                            WHERE thread_id IN (
-                                SELECT thread_id FROM threads WHERE user_id = ?
+                    # For regular users, search by their user_id in threads
+                    # For admins, search more broadly
+                    if not self.is_admin_user(user_id):
+                        cursor.execute('''
+                            SELECT thread_id FROM messages 
+                            WHERE telegram_message_id IN (
+                                SELECT telegram_message_id FROM messages 
+                                WHERE thread_id IN (
+                                    SELECT thread_id FROM threads WHERE user_id = ?
+                                )
+                                ORDER BY message_id DESC LIMIT 10
                             )
-                            ORDER BY message_id DESC LIMIT 5
-                        )
-                        ORDER BY message_id DESC LIMIT 1
-                    ''', (user_id,))
+                            ORDER BY message_id DESC LIMIT 1
+                        ''', (user_id,))
+                    else:
+                        # For admins, search more broadly across all threads they might be involved in
+                        cursor.execute('''
+                            SELECT thread_id FROM messages 
+                            WHERE telegram_message_id IN (
+                                SELECT telegram_message_id FROM messages 
+                                ORDER BY message_id DESC LIMIT 20
+                            )
+                            ORDER BY message_id DESC LIMIT 1
+                        ''')
                     result = cursor.fetchone()
                 
                 conn.close()
@@ -801,55 +833,69 @@ class EnhancedCouncilBot:
         logger.info(f"Reply - Thread ID: {thread_id}, Student User ID: {student_user_id}, Reply User ID: {user_id}, Is Admin: {is_admin}")
         logger.info(f"Reply message text: {reply_message}")
         
-        # Handle different scenarios
-        if is_admin:
-            # Admin is replying to user message
-            logger.info(f"Admin reply - Will send reply to chat_id: {student_user_id}")
+        # Handle different scenarios - check if replying user is actually part of this thread
+        admin_user_id_int = int(admin_user_id) if admin_user_id else None
+        
+        # Determine the role of the replying user in this specific thread
+        if user_id == student_user_id:
+            # Student is replying - send to admin
+            is_student_reply = True
+            target_user_id = admin_user_id_int
+            sender_name = "دانشجو"
+            logger.info(f"Student reply - Will send reply to admin chat_id: {admin_user_id_int}")
+            
+            # Check if user is blocked by admin
+            if admin_user_id_int and self.db.is_user_blocked(admin_user_id_int, user_id):
+                await update.message.reply_text("❌ شما توسط این مسئول بلاک شده‌اید.")
+                return
+        elif user_id == admin_user_id_int:
+            # Admin is replying - send to student
+            is_student_reply = False
+            target_user_id = student_user_id
+            sender_name = role_name
+            logger.info(f"Admin reply - Will send reply to student chat_id: {student_user_id}")
             
             # Check if user is blocked
             if self.db.is_user_blocked(user_id, student_user_id):
                 await update.message.reply_text("❌ این کاربر توسط شما بلاک شده است.")
                 return
-        
-            # Handle admin commands
-            if reply_message.startswith('/block'):
-                # Block the user
-                reason = reply_message[7:].strip() if len(reply_message) > 7 else None
-                self.db.block_user(user_id, student_user_id, reason)
-                await update.message.reply_text(f"✅ کاربر بلاک شد.\nدلیل: {reason or 'بدون دلیل'}")
-                return
-            
-            if reply_message.startswith('/unblock'):
-                # Unblock the user
-                self.db.unblock_user(user_id, student_user_id)
-                await update.message.reply_text("✅ کاربر از بلاک خارج شد.")
-                return
-            
-            if reply_message.startswith('/blocks'):
-                # List blocked users
-                blocked_users = self.db.get_blocked_users(user_id)
-                if not blocked_users:
-                    await update.message.reply_text("📋 هیچ کاربری بلاک نشده است.")
-                    return
-                
-                text = "📋 **کاربران بلاک شده:**\n\n"
-                for i, blocked in enumerate(blocked_users[:10], 1):  # Show first 10
-                    text += f"{i}. شناسه: `{blocked['user_id']}`\n"
-                    text += f"   تاریخ: {blocked['blocked_at'][:16]}\n"
-                    if blocked['reason']:
-                        text += f"   دلیل: {blocked['reason']}\n"
-                    text += "\n"
-                
-                await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-                return
         else:
-            # Regular user is replying to admin message
-            logger.info(f"User reply - Will send reply to admin chat_id: {admin_user_id}")
-            
-            # Check if user is blocked by admin
-            if admin_user_id and self.db.is_user_blocked(admin_user_id, user_id):
-                await update.message.reply_text("❌ شما توسط این مسئول بلاک شده‌اید.")
+            # User is not part of this thread
+            logger.warning(f"User {user_id} is not part of thread {thread_id} (student: {student_user_id}, admin: {admin_user_id_int})")
+            await update.message.reply_text("❌ شما مجاز به پاسخ در این گفتگو نیستید.")
+            return
+        
+        # Handle admin commands (only for admin replies)
+        if not is_student_reply and reply_message.startswith('/block'):
+            # Block the user
+            reason = reply_message[7:].strip() if len(reply_message) > 7 else None
+            self.db.block_user(user_id, student_user_id, reason)
+            await update.message.reply_text(f"✅ کاربر بلاک شد.\nدلیل: {reason or 'بدون دلیل'}")
+            return
+        
+        if not is_student_reply and reply_message.startswith('/unblock'):
+            # Unblock the user
+            self.db.unblock_user(user_id, student_user_id)
+            await update.message.reply_text("✅ کاربر از بلاک خارج شد.")
+            return
+        
+        if not is_student_reply and reply_message.startswith('/blocks'):
+            # List blocked users
+            blocked_users = self.db.get_blocked_users(user_id)
+            if not blocked_users:
+                await update.message.reply_text("📋 هیچ کاربری بلاک نشده است.")
                 return
+            
+            text = "📋 **کاربران بلاک شده:**\n\n"
+            for i, blocked in enumerate(blocked_users[:10], 1):  # Show first 10
+                text += f"{i}. شناسه: `{blocked['user_id']}`\n"
+                text += f"   تاریخ: {blocked['blocked_at'][:16]}\n"
+                if blocked['reason']:
+                    text += f"   دلیل: {blocked['reason']}\n"
+                text += "\n"
+            
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            return
         
         # Add message to database
         sender_type = 'admin' if is_admin else 'user'
@@ -862,7 +908,7 @@ class EnhancedCouncilBot:
         
         # Send reply
         try:
-            if is_admin:
+            if not is_student_reply:
                 # Admin sending reply to student
                 reply_text = f"""
 💬 **پاسخ از {role_name}**
@@ -874,9 +920,6 @@ class EnhancedCouncilBot:
 ---
 برای پاسخ، پیام خود را ارسال کنید.
                 """
-                
-                target_user_id = student_user_id
-                sender_name = role_name
             else:
                 # Student sending reply to admin
                 reply_text = f"""
@@ -889,9 +932,6 @@ class EnhancedCouncilBot:
 ---
 برای پاسخ، روی این پیام ریپلای کنید.
                 """
-                
-                target_user_id = admin_user_id
-                sender_name = "دانشجو"
             
             # Find the original message to reply to
             conn = sqlite3.connect(self.db.db_path)
@@ -938,7 +978,7 @@ class EnhancedCouncilBot:
 
 🆔 <b>شناسه گفتگو:</b> #{thread_id}
 👤 <b>از:</b> {sender_name}
-📝 <b>به:</b> {'دانشجو' if is_admin else role_name}
+📝 <b>به:</b> {'دانشجو' if not is_student_reply else role_name}
 📝 <b>پیام:</b> {reply_message}
 👤 <b>دانشجو:</b> {student_display}
             """
@@ -1310,8 +1350,19 @@ class EnhancedCouncilBot:
                 logger.error(f"Configuration error: {e}")
                 return
             
-            # Create application
-            application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+            # Create application with improved timeout settings
+            from telegram.request import HTTPXRequest
+            from httpx import Timeout
+            
+            # Configure request with longer timeouts for better network handling
+            request = HTTPXRequest(
+                connection_pool_size=8,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=10
+            )
+            
+            application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).request(request).build()
             
             # Add conversation handler
             conv_handler = ConversationHandler(
