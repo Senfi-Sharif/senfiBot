@@ -51,8 +51,25 @@ class EnhancedCouncilBot:
         # Channel ID for logging all messages
         self.CHANNEL_ID = Config.CHANNEL_ID  # Get from config
         
-        # Group ID for @shora_sharif
-        self.GROUP_ID = Config.GROUP_ID
+        # Group ID for @shora_sharif - convert to int if it's a string, or resolve username
+        group_id = Config.GROUP_ID
+        if group_id:
+            # Remove @ if present and strip whitespace
+            group_id = str(group_id).strip().lstrip('@')
+            
+            # Try to convert to int first
+            try:
+                self.GROUP_ID = int(group_id)
+                logger.info(f"GROUP_ID set to integer: {self.GROUP_ID}")
+            except (ValueError, TypeError):
+                # If it's not a number, it might be a username - we'll resolve it later
+                self.GROUP_ID = group_id
+                logger.warning(f"GROUP_ID is not a number, treating as username: {group_id}")
+                logger.warning("⚠️ GROUP_ID should be a number (chat_id), not a username!")
+                logger.warning("⚠️ Please set GROUP_ID in .env to the actual chat_id number")
+        else:
+            self.GROUP_ID = None
+            logger.warning("⚠️ GROUP_ID is not set in config!")
         
         # Google Sheets connection
         self.sheet = None
@@ -745,8 +762,13 @@ class EnhancedCouncilBot:
         return InlineKeyboardMarkup(keyboard)
 
     async def handle_admin_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle replies to admin messages (both from admins and regular users)"""
+        """Handle replies to admin messages (both from admins and regular users) - only for private chats"""
         logger.info(f"handle_admin_reply called for user {update.effective_user.id}")
+        
+        # Only process private chat replies (group messages are handled by handle_group_message)
+        if update.message and update.message.chat:
+            if update.message.chat.type != "private":
+                return  # Not a private chat, skip
         
         if not update.message.reply_to_message:
             logger.info("No reply_to_message found")
@@ -1594,10 +1616,10 @@ class EnhancedCouncilBot:
             # Add command to manually check and restore chat permissions (admin only)
             application.add_handler(CommandHandler('restore_permissions', self.manual_restore_permissions))
             
-            # Add handler for admin replies (from any user) - with highest priority
+            # Add handler for admin replies (from any user) - only for private chats, not groups
             application.add_handler(
                 MessageHandler(
-                    filters.TEXT & filters.REPLY,
+                    filters.TEXT & filters.REPLY & filters.ChatType.PRIVATE,
                     self.handle_admin_reply
                 ),
                 group=0  # Highest priority group
@@ -1622,15 +1644,62 @@ class EnhancedCouncilBot:
             )
             
             # Add handler for group messages - check if user is in Google Sheet
-            if self.GROUP_ID:
-                application.add_handler(
-                    MessageHandler(
-                        filters.ChatType.GROUP & filters.TEXT & ~filters.COMMAND,
-                        self.handle_group_message
-                    ),
-                    group=0  # High priority - check before other handlers
-                )
-                logger.info(f"✅ Group message handler added for group {self.GROUP_ID}")
+            # This handler should process ALL messages in group (including replies, media, etc.) before other handlers
+            logger.info("=" * 60)
+            logger.info(f"🔧 Registering group message handler")
+            logger.info(f"   Current GROUP_ID: {self.GROUP_ID}")
+            logger.info("=" * 60)
+            
+            # First, add a debug handler to log ALL group messages (this will help us debug)
+            async def debug_all_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                if update.message and update.message.chat:
+                    logger.info("=" * 60)
+                    logger.info("🔍 DEBUG: Received message in group/supergroup")
+                    logger.info(f"   Chat ID: {update.message.chat.id}")
+                    logger.info(f"   Chat Type: {update.message.chat.type}")
+                    logger.info(f"   Chat Title: {update.message.chat.title}")
+                    logger.info(f"   User ID: {update.effective_user.id if update.effective_user else 'None'}")
+                    logger.info(f"   Username: @{update.effective_user.username if update.effective_user and update.effective_user.username else 'no_username'}")
+                    logger.info(f"   Message Text: {update.message.text or 'No text (media/sticker/etc)'}")
+                    logger.info(f"   Expected GROUP_ID: {self.GROUP_ID}")
+                    logger.info("=" * 60)
+            
+            # Add debug handler for all group messages (both group and supergroup)
+            application.add_handler(
+                MessageHandler(
+                    filters.ChatType.GROUP | filters.ChatType.SUPERGROUP,
+                    debug_all_group_messages
+                ),
+                group=-2  # Even higher priority for debugging
+            )
+            
+            # Add handler for group messages - will check GROUP_ID inside the handler
+            # Use a custom filter that accepts all group messages, then check GROUP_ID inside
+            async def group_message_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                # Check if GROUP_ID is resolved, if not try to resolve it
+                if isinstance(self.GROUP_ID, str) and not str(self.GROUP_ID).lstrip('-').isdigit():
+                    try:
+                        username = str(self.GROUP_ID).strip().lstrip('@')
+                        chat = await context.bot.get_chat(f"@{username}")
+                        self.GROUP_ID = chat.id
+                        logger.info(f"✅ Resolved GROUP_ID to chat_id: {self.GROUP_ID}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to resolve GROUP_ID: {e}")
+                        return
+                
+                # Now call the actual handler
+                await self.handle_group_message(update, context)
+            
+            # Add handler with filter for group messages (not commands) - both group and supergroup
+            application.add_handler(
+                MessageHandler(
+                    (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & ~filters.COMMAND,
+                    group_message_wrapper
+                ),
+                group=-1  # Highest priority - check before ALL other handlers (even replies)
+            )
+            logger.info(f"✅ Group message handler added (priority: -1)")
+            logger.info("=" * 60)
             
             # Add periodic job to check and restore chat permissions for valid users (every hour)
             if self.GROUP_ID:
@@ -1652,6 +1721,44 @@ class EnhancedCouncilBot:
                     logger.error("❌ JobQueue is not available! Make sure python-telegram-bot[job-queue] is installed.")
             else:
                 logger.warning(f"⚠️ GROUP_ID not set: {self.GROUP_ID}. Permission checking jobs will not run.")
+            
+            # Add post_init handler to sync group members immediately after bot starts
+            async def post_init(application: Application) -> None:
+                """Sync group members to sheet immediately after bot starts"""
+                # First, try to resolve GROUP_ID if it's a username
+                if self.GROUP_ID and isinstance(self.GROUP_ID, str) and not str(self.GROUP_ID).lstrip('-').isdigit():
+                    logger.info(f"🔍 GROUP_ID is a username ({self.GROUP_ID}), trying to resolve to chat_id...")
+                    try:
+                        username = str(self.GROUP_ID).strip().lstrip('@')
+                        chat = await application.bot.get_chat(f"@{username}")
+                        self.GROUP_ID = chat.id
+                        logger.info(f"✅ Resolved GROUP_ID to chat_id: {self.GROUP_ID}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to resolve GROUP_ID username: {e}")
+                        logger.error("⚠️ Please set GROUP_ID in .env to the actual chat_id number (not username)")
+                        return
+                
+                # Sync group members
+                if self.GROUP_ID:
+                    logger.info("=" * 50)
+                    logger.info("POST_INIT: Syncing group members to sheet on startup...")
+                    logger.info(f"   Using GROUP_ID: {self.GROUP_ID}")
+                    logger.info("=" * 50)
+                    try:
+                        # Create a context for sync
+                        class DummyContext:
+                            def __init__(self, bot):
+                                self.bot = bot
+                        
+                        dummy_context = DummyContext(application.bot)
+                        await self.sync_group_members_to_sheet(dummy_context)
+                        logger.info("✅ POST_INIT: Startup sync completed")
+                    except Exception as e:
+                        logger.error(f"❌ POST_INIT: Error in startup sync: {e}")
+                else:
+                    logger.warning("⚠️ GROUP_ID is None after resolution!")
+            
+            application.post_init = post_init
             
             # Start the bot
             logger.info("Starting Enhanced Council Bot...")
@@ -1965,25 +2072,38 @@ class EnhancedCouncilBot:
             
             # Add members who are in group but not in sheet
             added_count = 0
+            logger.info(f"[SYNC] Checking {len(group_members)} group members against {len(sheet_user_ids)} existing sheet users")
+            
             for member in group_members:
-                if member['user_id'] not in sheet_user_ids:
+                user_id = member['user_id']
+                username = member.get('username', '')
+                first_name = member.get('first_name', '')
+                
+                # Log each member being checked
+                logger.debug(f"[SYNC] Checking member: {user_id} (@{username}) - {first_name}")
+                
+                if user_id not in sheet_user_ids:
                     try:
                         new_row = [
-                            str(member['user_id']),      # Column A: Telegram ID
-                            member['first_name'],        # Column B: First Name
-                            member['last_name'],         # Column C: Last Name
-                            member['username'],          # Column D: Username
+                            str(user_id),                # Column A: Telegram ID
+                            first_name,                  # Column B: First Name
+                            member.get('last_name', ''), # Column C: Last Name
+                            username,                    # Column D: Username
                             "",                          # Column E: Student Number (empty)
                             "0"                          # Column F: is_valid (default 0)
                         ]
                         self.sheet.append_row(new_row)
                         added_count += 1
-                        logger.info(f"Added new member to sheet: {member['user_id']} ({member['first_name']})")
+                        logger.info(f"✅ [SYNC] Added new member to sheet: {user_id} (@{username}) - {first_name}")
                     except Exception as e:
-                        logger.error(f"Error adding member {member['user_id']} to sheet: {e}")
+                        logger.error(f"❌ [SYNC] Error adding member {user_id} (@{username}) to sheet: {e}")
+                else:
+                    logger.debug(f"[SYNC] Member {user_id} (@{username}) already in sheet, skipping")
             
             if added_count > 0:
-                logger.info(f"Added {added_count} new members to sheet")
+                logger.info(f"✅ [SYNC] Successfully added {added_count} new members to sheet")
+            else:
+                logger.info(f"[SYNC] No new members to add (all {len(group_members)} members already in sheet)")
             
             return added_count
             
@@ -1995,9 +2115,18 @@ class EnhancedCouncilBot:
             return 0
     
     async def check_and_restore_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE):
-        """Periodic job to check and update chat permissions based on is_valid status"""
+        """Periodic job to check and update chat permissions based on is_valid status
+        This runs in background and doesn't block the bot"""
+        # Job queue already runs in background, but we'll make it non-blocking
+        # by using asyncio.create_task to run the actual work
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._check_and_restore_chat_permissions_task(context))
+    
+    async def _check_and_restore_chat_permissions_task(self, context: ContextTypes.DEFAULT_TYPE):
+        """Background task to check and update chat permissions"""
         logger.info("=" * 50)
-        logger.info("Starting check_and_restore_chat_permissions job")
+        logger.info("Starting check_and_restore_chat_permissions job (background)")
         logger.info("=" * 50)
         logger.info("Running periodic check for all users to update chat permissions...")
         logger.info("Step 1: Syncing group members to sheet...")
@@ -2146,46 +2275,93 @@ class EnhancedCouncilBot:
             return False
     
     async def handle_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle messages in the group - check if user is in Google Sheet"""
+        """Handle messages in the group - check if user is in Google Sheet (handles all message types including replies, media, etc.)
+        This handler silently deletes messages from unauthorized users and restricts their access - no replies or messages sent."""
+        logger.info("=" * 60)
+        logger.info("🔍 handle_group_message CALLED")
+        logger.info("=" * 60)
+        
         # Only process messages from the configured group
         if not update.message or not update.message.chat:
+            logger.warning("❌ handle_group_message: No message or chat")
             return
         
-        chat_id = str(update.message.chat.id)
-        if chat_id != str(self.GROUP_ID):
+        chat_id = update.message.chat.id
+        chat_type = update.message.chat.type
+        logger.info(f" Chat ID: {chat_id}, Type: {chat_type}, Expected GROUP_ID: {self.GROUP_ID}")
+        
+        # Compare both as int and as string to handle different formats
+        if chat_id != self.GROUP_ID and str(chat_id) != str(self.GROUP_ID):
+            logger.warning(f"❌ handle_group_message: Chat ID mismatch - got {chat_id} (type: {type(chat_id)}), expected {self.GROUP_ID} (type: {type(self.GROUP_ID)})")
             return  # Not our target group
+        
+        logger.info(f"✅ handle_group_message: Processing message from chat {chat_id}")
         
         # Skip bot messages
         if update.effective_user.is_bot:
+            logger.info("⏭️ handle_group_message: Skipping bot message")
             return
         
         user = update.effective_user
         user_id = user.id
+        username = user.username or "no_username"
+        first_name = user.first_name or "no_name"
+        
+        logger.info(f"👤 User: {user_id} (@{username}) - {first_name}")
+        logger.info(f"📝 Message text: {update.message.text or 'No text (media/sticker/etc)'}")
         
         # Check if user is in Google Sheet
-        if not self.is_user_in_sheet(user_id):
-            logger.info(f"User {user_id} ({user.first_name}) not found in sheet, deleting message and restricting access")
+        logger.info(f"🔍 Checking if user {user_id} is in sheet...")
+        is_in_sheet = self.is_user_in_sheet(user_id)
+        logger.info(f"📊 User {user_id} in sheet: {is_in_sheet}")
+        
+        if not is_in_sheet:
+            logger.warning(f"⚠️ User {user_id} (@{username}) NOT found in sheet, deleting message and restricting access")
             
             try:
-                # Delete the message
+                # Delete the message silently (no error message to user)
+                logger.info(f"🗑️ Attempting to delete message from user {user_id}...")
                 await update.message.delete()
-                logger.info(f"Deleted message from user {user_id}")
+                logger.info(f"✅ Deleted message from user {user_id}")
                 
-                # Restrict user permissions
+                # Restrict user permissions silently
+                logger.info(f"🔒 Attempting to restrict permissions for user {user_id}...")
                 await self.restrict_chat_permissions(context, user_id)
-                logger.info(f"Restricted permissions for user {user_id}")
+                logger.info(f"✅ Restricted permissions for user {user_id}")
                 
-                # Add user to sheet
+                # Add user to sheet silently
                 first_name = user.first_name or ""
                 last_name = user.last_name or ""
                 username = user.username or ""
-                await self.add_user_to_sheet(user_id, first_name, last_name, username)
-                logger.info(f"Added user {user_id} to sheet")
+                logger.info(f"➕ Attempting to add user {user_id} to sheet...")
+                success = await self.add_user_to_sheet(user_id, first_name, last_name, username)
+                if success:
+                    logger.info(f"✅ Added user {user_id} (@{username}) to sheet")
+                else:
+                    logger.error(f"❌ Failed to add user {user_id} to sheet")
+                
+                # Return immediately to prevent any other handlers from processing this message
+                # No messages will be sent to the group
+                logger.info("=" * 60)
+                logger.info("✅ handle_group_message COMPLETED - message deleted, user restricted, added to sheet")
+                logger.info("=" * 60)
+                return
                 
             except TelegramError as e:
-                logger.error(f"Error handling unauthorized user {user_id}: {e}")
+                logger.error(f"❌ TelegramError handling unauthorized user {user_id}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Still return to prevent other handlers - no error messages sent
+                return
             except Exception as e:
-                logger.error(f"Unexpected error handling unauthorized user {user_id}: {e}")
+                logger.error(f"❌ Unexpected error handling unauthorized user {user_id}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Still return to prevent other handlers - no error messages sent
+                return
+        else:
+            logger.info(f"✅ User {user_id} is in sheet, allowing message")
+            logger.info("=" * 60)
     
     async def manual_restore_permissions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Manual command to check and update chat permissions based on is_valid status (admin only)"""
