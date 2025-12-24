@@ -15,6 +15,8 @@ from telegram.constants import ParseMode
 
 from database import Database
 from config import Config
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Configure logging
 logging.basicConfig(
@@ -24,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-CHOOSING_ROLE, WAITING_FOR_MESSAGE = range(2)
+CHOOSING_ROLE, WAITING_FOR_MESSAGE, WAITING_FOR_STUDENT_NUMBER = range(3)
 
 class EnhancedCouncilBot:
     def __init__(self):
@@ -40,6 +42,10 @@ class EnhancedCouncilBot:
         
         # Channel ID for logging all messages
         self.CHANNEL_ID = Config.CHANNEL_ID  # Get from config
+        
+        # Google Sheets connection
+        self.sheet = None
+        self.init_google_sheets()
         
         # Load message mappings from database on startup
         self.load_message_mappings()
@@ -148,6 +154,24 @@ class EnhancedCouncilBot:
                 logger.error(f"Error releasing lock: {e}")
             finally:
                 self.lock_file = None
+    
+    def init_google_sheets(self):
+        """Initialize Google Sheets connection"""
+        try:
+            SCOPES = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            creds = Credentials.from_service_account_file(
+                "service_account.json",
+                scopes=SCOPES
+            )
+            client = gspread.authorize(creds)
+            self.sheet = client.open_by_key("1S0qznFEtw31fhaGXNOsggg0nGvM6g74Rp3A8PVwGFsI").sheet1
+            logger.info("Google Sheets connection initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Google Sheets: {e}")
+            self.sheet = None
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -178,6 +202,7 @@ class EnhancedCouncilBot:
         
         keyboard.append([InlineKeyboardButton("👥 گروه شورای صنفی", url="https://t.me/shora_sharif")])
         keyboard.append([InlineKeyboardButton("🆔 شناسه من", callback_data="get_user_id")])
+        keyboard.append([InlineKeyboardButton("🎓 شماره دانشجویی", callback_data="student_number")])
         keyboard.append([InlineKeyboardButton("❓ راهنما", callback_data="help")])
         
         # Add block list button only for admins and role users
@@ -228,6 +253,10 @@ class EnhancedCouncilBot:
         elif query.data == "help":
             await self.show_help(update, context)
             return CHOOSING_ROLE
+        
+        elif query.data == "student_number":
+            await self.request_student_number(update, context)
+            return WAITING_FOR_STUDENT_NUMBER
         
         elif query.data == "back_to_menu":
             await self.show_role_menu(update, context)
@@ -1337,6 +1366,141 @@ class EnhancedCouncilBot:
             parse_mode=ParseMode.MARKDOWN
         )
     
+    async def request_student_number(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Request student number from user"""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            text="🎓 **شماره دانشجویی**\n\n"
+                 "شماره دانشجویی‌تون رو با حروف انگلیسی وارد کنید:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def handle_student_number(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle student number input"""
+        user = update.effective_user
+        user_id = user.id
+        student_number_text = update.message.text.strip()
+        
+        # Check if user wants to go back to menu
+        if student_number_text == "🏠 منوی اصلی":
+            remove_keyboard = ReplyKeyboardRemove()
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🏠 بازگشت به منوی اصلی",
+                reply_markup=remove_keyboard
+            )
+            await self.show_role_menu(update, context)
+            return CHOOSING_ROLE
+        
+        # Validate student number
+        try:
+            # Check if it's a number
+            student_number = int(student_number_text)
+            
+            # Check range: 80000000 to 410000000
+            if student_number < 80000000 or student_number > 410000000:
+                await update.message.reply_text(
+                    "❌ شماره دانشجویی باید یک عدد انگلیسی معتبر باشد.\n"
+                "لطفاً دوباره تلاش کنید:"
+                )
+                return WAITING_FOR_STUDENT_NUMBER
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ شماره دانشجویی باید یک عدد انگلیسی معتبر باشد.\n"
+                "لطفاً دوباره تلاش کنید:"
+            )
+            return WAITING_FOR_STUDENT_NUMBER
+        
+        # Update Google Sheets
+        try:
+            if not self.sheet:
+                await update.message.reply_text(
+                    "❌ خطا در اتصال به Google Sheets. لطفاً بعداً تلاش کنید."
+                )
+                await self.show_role_menu(update, context)
+                return CHOOSING_ROLE
+            
+            # Get all values from the sheet
+            all_values = self.sheet.get_all_values()
+            
+            # Find user by Telegram ID (column A)
+            user_found = False
+            row_index = None
+            
+            for idx, row in enumerate(all_values, start=1):
+                if row and len(row) > 0:
+                    try:
+                        # Column A is the Telegram ID
+                        if str(row[0]) == str(user_id):
+                            user_found = True
+                            row_index = idx
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Prepare user data
+            first_name = user.first_name or ""
+            last_name = user.last_name or ""
+            username = user.username or ""
+            
+            if user_found and row_index:
+                # Update existing row - update column E (index 4)
+                # Ensure row has at least 5 columns
+                current_row = all_values[row_index - 1]
+                while len(current_row) < 5:
+                    current_row.append("")
+                
+                # Update column E (student number)
+                self.sheet.update_cell(row_index, 5, str(student_number))
+                
+                # Also update other columns if they're empty
+                if len(current_row) > 1 and not current_row[1]:
+                    self.sheet.update_cell(row_index, 2, first_name)
+                if len(current_row) > 2 and not current_row[2]:
+                    self.sheet.update_cell(row_index, 3, last_name)
+                if len(current_row) > 3 and not current_row[3]:
+                    self.sheet.update_cell(row_index, 4, username)
+                
+                await update.message.reply_text(
+                    f"✅ شماره دانشجویی شما با موفقیت به‌روزرسانی شد!\n\n"
+                    f"🎓 شماره دانشجویی: {student_number}"
+                )
+            else:
+                # Create new row
+                new_row = [
+                    str(user_id),      # Column A: Telegram ID
+                    first_name,        # Column B: First Name
+                    last_name,         # Column C: Last Name
+                    username,          # Column D: Username
+                    str(student_number)  # Column E: Student Number
+                ]
+                self.sheet.append_row(new_row)
+                
+                await update.message.reply_text(
+                    f"✅ شماره دانشجویی شما با موفقیت ثبت شد!\n\n"
+                    f"🎓 شماره دانشجویی: {student_number}"
+                )
+            
+            # Return to main menu
+            await self.show_role_menu(update, context)
+            return CHOOSING_ROLE
+            
+        except Exception as e:
+            logger.error(f"Error updating Google Sheets: {e}")
+            await update.message.reply_text(
+                f"❌ خطا در به‌روزرسانی اطلاعات: {str(e)}\n"
+                "لطفاً بعداً تلاش کنید."
+            )
+            await self.show_role_menu(update, context)
+            return CHOOSING_ROLE
+    
     def run(self):
         """Run the bot"""
         # Try to acquire lock to prevent multiple instances
@@ -1378,6 +1542,11 @@ class EnhancedCouncilBot:
                     WAITING_FOR_MESSAGE: [
                         CallbackQueryHandler(self.handle_role_selection),
                         MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, self.handle_message),
+                        CommandHandler('cancel', self.cancel)
+                    ],
+                    WAITING_FOR_STUDENT_NUMBER: [
+                        CallbackQueryHandler(self.handle_role_selection),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, self.handle_student_number),
                         CommandHandler('cancel', self.cancel)
                     ]
                 },
