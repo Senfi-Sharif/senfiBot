@@ -1621,6 +1621,17 @@ class EnhancedCouncilBot:
                 group=0  # High priority
             )
             
+            # Add handler for group messages - check if user is in Google Sheet
+            if self.GROUP_ID:
+                application.add_handler(
+                    MessageHandler(
+                        filters.ChatType.GROUP & filters.TEXT & ~filters.COMMAND,
+                        self.handle_group_message
+                    ),
+                    group=0  # High priority - check before other handlers
+                )
+                logger.info(f"✅ Group message handler added for group {self.GROUP_ID}")
+            
             # Add periodic job to check and restore chat permissions for valid users (every hour)
             if self.GROUP_ID:
                 job_queue = application.job_queue
@@ -2079,6 +2090,102 @@ class EnhancedCouncilBot:
             
         except Exception as e:
             logger.error(f"Error in check_and_restore_chat_permissions: {e}")
+    
+    def is_user_in_sheet(self, user_id: int) -> bool:
+        """Check if a user ID exists in Google Sheet (Column A)"""
+        try:
+            if not self.sheet:
+                logger.warning("Google Sheets not initialized")
+                return False
+            
+            # Get all values from the sheet
+            all_values = self.sheet.get_all_values()
+            
+            # Check if user_id exists in Column A (index 0)
+            for row in all_values:
+                if row and len(row) > 0:
+                    try:
+                        if str(row[0]).strip() == str(user_id):
+                            return True
+                    except (ValueError, IndexError):
+                        continue
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking user in sheet: {e}")
+            return False
+    
+    async def add_user_to_sheet(self, user_id: int, first_name: str = "", last_name: str = "", username: str = ""):
+        """Add a user to Google Sheet"""
+        try:
+            if not self.sheet:
+                logger.warning("Google Sheets not initialized")
+                return False
+            
+            # Check if user already exists
+            if self.is_user_in_sheet(user_id):
+                logger.info(f"User {user_id} already exists in sheet")
+                return True
+            
+            # Add new row
+            new_row = [
+                str(user_id),      # Column A: Telegram ID
+                first_name,        # Column B: First Name
+                last_name,         # Column C: Last Name
+                username,          # Column D: Username
+                "",                # Column E: Student Number (empty)
+                "0"                # Column F: is_valid (default 0 - restricted)
+            ]
+            self.sheet.append_row(new_row)
+            logger.info(f"Added user {user_id} to sheet: {first_name} {last_name} (@{username})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding user to sheet: {e}")
+            return False
+    
+    async def handle_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle messages in the group - check if user is in Google Sheet"""
+        # Only process messages from the configured group
+        if not update.message or not update.message.chat:
+            return
+        
+        chat_id = str(update.message.chat.id)
+        if chat_id != str(self.GROUP_ID):
+            return  # Not our target group
+        
+        # Skip bot messages
+        if update.effective_user.is_bot:
+            return
+        
+        user = update.effective_user
+        user_id = user.id
+        
+        # Check if user is in Google Sheet
+        if not self.is_user_in_sheet(user_id):
+            logger.info(f"User {user_id} ({user.first_name}) not found in sheet, deleting message and restricting access")
+            
+            try:
+                # Delete the message
+                await update.message.delete()
+                logger.info(f"Deleted message from user {user_id}")
+                
+                # Restrict user permissions
+                await self.restrict_chat_permissions(context, user_id)
+                logger.info(f"Restricted permissions for user {user_id}")
+                
+                # Add user to sheet
+                first_name = user.first_name or ""
+                last_name = user.last_name or ""
+                username = user.username or ""
+                await self.add_user_to_sheet(user_id, first_name, last_name, username)
+                logger.info(f"Added user {user_id} to sheet")
+                
+            except TelegramError as e:
+                logger.error(f"Error handling unauthorized user {user_id}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error handling unauthorized user {user_id}: {e}")
     
     async def manual_restore_permissions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Manual command to check and update chat permissions based on is_valid status (admin only)"""

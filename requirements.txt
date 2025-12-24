@@ -3,4 +3,6 @@ psutil>=5.8.0
 gspread>=5.0.0
 google-auth>=2.0.0
 pyrogram>=2.0.0
-tgcrypto>=0.4.0 
+tgcrypto>=0.4.0
+python-dotenv>=1.0.0
+httpx>=0.24.0 
