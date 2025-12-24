@@ -75,6 +75,11 @@ class EnhancedCouncilBot:
         self.sheet = None
         self.init_google_sheets()
         
+        # Local cache for sheet data to avoid frequent API calls
+        # Format: {user_id: {'first_name': str, 'last_name': str, 'username': str, 'student_number': str, 'is_valid': str}}
+        self.sheet_cache: Dict[int, Dict[str, str]] = {}
+        self.sheet_cache_last_update: Optional[datetime] = None
+        
         # Pyrogram client for getting group members
         # Use bot token instead of user account to avoid phone number authentication
         self.pyrogram_client = None
@@ -1713,10 +1718,10 @@ class EnhancedCouncilBot:
                     # Then run every hour
                     job_queue.run_repeating(
                         self.check_and_restore_chat_permissions,
-                        interval=86400,  # 1 hour in seconds
-                        first=86405  # Start after first run + 5 seconds
+                        interval=1800,  # 1 hour in seconds (changed from 24 hours)
+                        first=1805  # Start after first run + 5 seconds
                     )
-                    logger.info(f"✅ Chat permissions job scheduled: immediate run + every hour for group {self.GROUP_ID}")
+                    logger.info(f"✅ Chat permissions job scheduled: immediate run + every 1 hour for group {self.GROUP_ID}")
                 else:
                     logger.error("❌ JobQueue is not available! Make sure python-telegram-bot[job-queue] is installed.")
             else:
@@ -1752,7 +1757,11 @@ class EnhancedCouncilBot:
                         
                         dummy_context = DummyContext(application.bot)
                         await self.sync_group_members_to_sheet(dummy_context)
-                        logger.info("✅ POST_INIT: Startup sync completed")
+                        
+                        # Initialize cache after sync
+                        logger.info("Initializing sheet cache...")
+                        self.refresh_sheet_cache()
+                        logger.info("✅ POST_INIT: Startup sync and cache initialization completed")
                     except Exception as e:
                         logger.error(f"❌ POST_INIT: Error in startup sync: {e}")
                 else:
@@ -1867,46 +1876,81 @@ class EnhancedCouncilBot:
         self.user_message_counts[user_id][timestamp] += 1
         self.user_last_message[user_id] = now
     
-    def get_all_users_from_sheet(self) -> dict:
-        """Get all users from Google Sheets with their is_valid status
-        Returns: dict with 'valid' (list of user_ids with is_valid=1) and 'invalid' (list of user_ids with is_valid=0)
-        """
-        result = {'valid': [], 'invalid': []}
-        
+    def refresh_sheet_cache(self) -> bool:
+        """Refresh local cache from Google Sheets
+        Returns True if successful, False otherwise"""
         try:
             if not self.sheet:
                 logger.warning("Google Sheets not initialized")
-                return result
+                return False
             
+            logger.info("🔄 Refreshing sheet cache from Google Sheets...")
             # Get all values from the sheet
             all_values = self.sheet.get_all_values()
+            
+            new_cache: Dict[int, Dict[str, str]] = {}
             
             for idx, row in enumerate(all_values, start=1):
                 if row and len(row) >= 6:  # At least 6 columns (A-F)
                     try:
-                        # Column A is Telegram ID, Column F (index 5) is is_valid
+                        # Column A: Telegram ID, B: First Name, C: Last Name, D: Username, E: Student Number, F: is_valid
                         telegram_id = str(row[0]).strip()
-                        is_valid = str(row[5]).strip() if len(row) > 5 else "0"
-                        
                         if telegram_id:
                             try:
                                 user_id = int(telegram_id)
-                                if is_valid == "1":
-                                    result['valid'].append(user_id)
-                                else:
-                                    result['invalid'].append(user_id)
+                                new_cache[user_id] = {
+                                    'first_name': str(row[1]).strip() if len(row) > 1 else "",
+                                    'last_name': str(row[2]).strip() if len(row) > 2 else "",
+                                    'username': str(row[3]).strip() if len(row) > 3 else "",
+                                    'student_number': str(row[4]).strip() if len(row) > 4 else "",
+                                    'is_valid': str(row[5]).strip() if len(row) > 5 else "0"
+                                }
                             except ValueError:
                                 continue
                     except (ValueError, IndexError) as e:
                         logger.debug(f"Error parsing row {idx}: {e}")
                         continue
             
-            logger.info(f"Found {len(result['valid'])} valid users (is_valid=1) and {len(result['invalid'])} invalid users (is_valid=0) in Google Sheets")
-            return result
+            self.sheet_cache = new_cache
+            self.sheet_cache_last_update = datetime.now()
+            logger.info(f"✅ Sheet cache refreshed: {len(new_cache)} users cached")
+            return True
             
         except Exception as e:
-            logger.error(f"Error reading Google Sheets: {e}")
-            return result
+            logger.error(f"Error refreshing sheet cache: {e}")
+            return False
+    
+    def get_all_users_from_sheet(self, use_cache: bool = True) -> dict:
+        """Get all users from cache or Google Sheets with their is_valid status
+        Returns: dict with 'valid' (list of user_ids with is_valid=1) and 'invalid' (list of user_ids with is_valid=0)
+        """
+        result = {'valid': [], 'invalid': []}
+        
+        # Use cache if available and fresh (less than 1 hour old)
+        if use_cache and self.sheet_cache and self.sheet_cache_last_update:
+            time_diff = datetime.now() - self.sheet_cache_last_update
+            if time_diff.total_seconds() < 3600:  # Cache is less than 1 hour old
+                logger.debug("Using cached sheet data")
+                for user_id, user_data in self.sheet_cache.items():
+                    if user_data.get('is_valid') == "1":
+                        result['valid'].append(user_id)
+                    else:
+                        result['invalid'].append(user_id)
+                logger.info(f"Found {len(result['valid'])} valid users and {len(result['invalid'])} invalid users from cache")
+                return result
+        
+        # Cache is stale or doesn't exist, refresh it
+        if self.refresh_sheet_cache():
+            for user_id, user_data in self.sheet_cache.items():
+                if user_data.get('is_valid') == "1":
+                    result['valid'].append(user_id)
+                else:
+                    result['invalid'].append(user_id)
+            logger.info(f"Found {len(result['valid'])} valid users (is_valid=1) and {len(result['invalid'])} invalid users (is_valid=0) in Google Sheets")
+        else:
+            logger.warning("Failed to refresh cache, returning empty result")
+        
+        return result
     
     def get_valid_users_from_sheet(self) -> list:
         """Get list of user IDs from Google Sheets where is_valid (column F) is 1"""
@@ -2102,6 +2146,8 @@ class EnhancedCouncilBot:
             
             if added_count > 0:
                 logger.info(f"✅ [SYNC] Successfully added {added_count} new members to sheet")
+                # Refresh cache after adding new members
+                self.refresh_sheet_cache()
             else:
                 logger.info(f"[SYNC] No new members to add (all {len(group_members)} members already in sheet)")
             
@@ -2116,44 +2162,47 @@ class EnhancedCouncilBot:
     
     async def check_and_restore_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE):
         """Periodic job to check and update chat permissions based on is_valid status
-        This runs in background and doesn't block the bot"""
-        # Job queue already runs in background, but we'll make it non-blocking
-        # by using asyncio.create_task to run the actual work
-        import asyncio
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._check_and_restore_chat_permissions_task(context))
-    
-    async def _check_and_restore_chat_permissions_task(self, context: ContextTypes.DEFAULT_TYPE):
-        """Background task to check and update chat permissions"""
+        This runs in background via job queue and doesn't block the bot
+        Uses local cache and only applies changes"""
         logger.info("=" * 50)
-        logger.info("Starting check_and_restore_chat_permissions job (background)")
+        logger.info("Starting check_and_restore_chat_permissions job (background - non-blocking)")
         logger.info("=" * 50)
-        logger.info("Running periodic check for all users to update chat permissions...")
-        logger.info("Step 1: Syncing group members to sheet...")
         
         if not self.GROUP_ID:
             logger.warning("GROUP_ID not configured, skipping permission check")
-            logger.warning(f"GROUP_ID value: {self.GROUP_ID}")
             return
-        
-        logger.info(f"GROUP_ID is set: {self.GROUP_ID}")
-        logger.info(f"Sheet initialized: {self.sheet is not None}")
-        logger.info(f"Pyrogram client available: {self.pyrogram_client is not None}")
         
         try:
             # Step 1: Sync group members to sheet (add members in group but not in sheet)
+            logger.info("Step 1: Syncing group members to sheet...")
             added_count = await self.sync_group_members_to_sheet(context)
             if added_count > 0:
                 logger.info(f"Added {added_count} new members to sheet")
+                # Refresh cache after adding new members
+                self.refresh_sheet_cache()
             
-            # Step 2: Get all users from sheet with their is_valid status
-            logger.info("Step 2: Getting users from sheet and updating permissions...")
-            all_users = self.get_all_users_from_sheet()
-            valid_users = all_users['valid']
-            invalid_users = all_users['invalid']
+            # Step 2: Refresh cache from Google Sheets (only if cache is stale or doesn't exist)
+            logger.info("Step 2: Refreshing sheet cache...")
+            old_cache = self.sheet_cache.copy() if self.sheet_cache else {}
+            cache_refreshed = self.refresh_sheet_cache()
             
-            # Filter: Only process users who are actually in the group
-            # Get group members using Pyrogram
+            if not cache_refreshed:
+                logger.warning("Failed to refresh cache, using old cache if available")
+                if not old_cache:
+                    logger.error("No cache available, skipping permission check")
+                    return
+            
+            # Step 3: Compare old and new cache to find changes
+            logger.info("Step 3: Comparing cache to find changes...")
+            changes = self._find_permission_changes(old_cache, self.sheet_cache)
+            
+            if not changes['to_restore'] and not changes['to_restrict']:
+                logger.info("✅ No permission changes detected, all permissions are up to date")
+                return
+            
+            logger.info(f"Found {len(changes['to_restore'])} users to restore, {len(changes['to_restrict'])} users to restrict")
+            
+            # Step 4: Get group members to filter (only process users in group)
             group_member_ids = set()
             if self.pyrogram_client:
                 try:
@@ -2168,61 +2217,92 @@ class EnhancedCouncilBot:
                     logger.warning(f"Could not get group members with Pyrogram: {e}")
                     if self.pyrogram_client.is_connected:
                         await self.pyrogram_client.stop()
-                    # Continue anyway, will fail gracefully during permission update
-            else:
-                logger.warning("Pyrogram not available, cannot filter by group membership")
             
-            # Filter users to only those in the group
-            valid_users_in_group = [uid for uid in valid_users if not group_member_ids or uid in group_member_ids]
-            invalid_users_in_group = [uid for uid in invalid_users if not group_member_ids or uid in group_member_ids]
+            # Filter changes to only users in the group
+            to_restore = [uid for uid in changes['to_restore'] if not group_member_ids or uid in group_member_ids]
+            to_restrict = [uid for uid in changes['to_restrict'] if not group_member_ids or uid in group_member_ids]
             
-            if not valid_users_in_group and not invalid_users_in_group:
-                logger.info("No users found in sheet that are in the group")
+            if not to_restore and not to_restrict:
+                logger.info("No changes for users in the group")
                 return
             
+            # Step 5: Apply changes
+            logger.info("Step 4: Applying permission changes...")
             restored_count = 0
             restricted_count = 0
             error_count = 0
             
-            # Restore permissions for users with is_valid=1 (only if in group)
-            for user_id in valid_users_in_group:
+            import asyncio
+            # Restore permissions for users with is_valid=1
+            for user_id in to_restore:
                 try:
                     success = await self.restore_chat_permissions(context, user_id)
                     if success:
                         restored_count += 1
-                    
-                    # Small delay to avoid rate limiting
-                    import asyncio
-                    await asyncio.sleep(0.2)
-                    
+                    await asyncio.sleep(0.2)  # Rate limiting
                 except Exception as e:
-                    logger.error(f"Error processing valid user {user_id}: {e}")
+                    logger.error(f"Error restoring permissions for user {user_id}: {e}")
                     error_count += 1
             
-            # Restrict permissions for users with is_valid=0 (only if in group)
-            for user_id in invalid_users_in_group:
+            # Restrict permissions for users with is_valid=0
+            for user_id in to_restrict:
                 try:
                     success = await self.restrict_chat_permissions(context, user_id)
                     if success:
                         restricted_count += 1
-                    
-                    # Small delay to avoid rate limiting
-                    import asyncio
-                    await asyncio.sleep(0.2)
-                    
+                    await asyncio.sleep(0.2)  # Rate limiting
                 except Exception as e:
-                    logger.error(f"Error processing invalid user {user_id}: {e}")
+                    logger.error(f"Error restricting permissions for user {user_id}: {e}")
                     error_count += 1
             
             if restored_count > 0 or restricted_count > 0:
-                logger.info(f"Successfully updated permissions: {restored_count} users restored, {restricted_count} users restricted in group {self.GROUP_ID}")
+                logger.info(f"✅ Successfully updated permissions: {restored_count} restored, {restricted_count} restricted")
             
         except Exception as e:
             logger.error(f"Error in check_and_restore_chat_permissions: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _find_permission_changes(self, old_cache: Dict[int, Dict[str, str]], new_cache: Dict[int, Dict[str, str]]) -> dict:
+        """Find changes in is_valid status between old and new cache
+        Returns: {'to_restore': [user_ids], 'to_restrict': [user_ids]}"""
+        changes = {'to_restore': [], 'to_restrict': []}
+        
+        # Check users in new cache
+        for user_id, user_data in new_cache.items():
+            new_is_valid = user_data.get('is_valid', '0')
+            
+            if user_id in old_cache:
+                old_is_valid = old_cache[user_id].get('is_valid', '0')
+                # Status changed
+                if old_is_valid != new_is_valid:
+                    if new_is_valid == "1":
+                        changes['to_restore'].append(user_id)
+                    else:
+                        changes['to_restrict'].append(user_id)
+            else:
+                # New user
+                if new_is_valid == "1":
+                    changes['to_restore'].append(user_id)
+                else:
+                    changes['to_restrict'].append(user_id)
+        
+        # Check users removed from cache (shouldn't happen often, but handle it)
+        for user_id in old_cache:
+            if user_id not in new_cache:
+                # User removed from sheet - restrict them
+                changes['to_restrict'].append(user_id)
+        
+        return changes
     
     def is_user_in_sheet(self, user_id: int) -> bool:
-        """Check if a user ID exists in Google Sheet (Column A)"""
+        """Check if a user ID exists in Google Sheet (Column A) - uses cache if available"""
         try:
+            # Use cache if available
+            if self.sheet_cache:
+                return user_id in self.sheet_cache
+            
+            # Cache not available, check directly (will be slow but works)
             if not self.sheet:
                 logger.warning("Google Sheets not initialized")
                 return False
@@ -2268,6 +2348,16 @@ class EnhancedCouncilBot:
             ]
             self.sheet.append_row(new_row)
             logger.info(f"Added user {user_id} to sheet: {first_name} {last_name} (@{username})")
+            
+            # Update cache
+            self.sheet_cache[user_id] = {
+                'first_name': first_name,
+                'last_name': last_name,
+                'username': username,
+                'student_number': '',
+                'is_valid': '0'
+            }
+            
             return True
             
         except Exception as e:
