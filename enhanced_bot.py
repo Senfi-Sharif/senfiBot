@@ -16,6 +16,7 @@ from telegram.error import TelegramError
 
 from database import Database
 from config import Config
+from sheet_cache_manager import SheetCacheManager
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -75,7 +76,10 @@ class EnhancedCouncilBot:
         self.sheet = None
         self.init_google_sheets()
         
-        # Local cache for sheet data to avoid frequent API calls
+        # Initialize cache manager for efficient sheet data caching and change detection
+        self.cache_manager = SheetCacheManager(cache_file_path="sheet_cache.json")
+        
+        # Legacy cache variables (kept for backward compatibility but now using cache_manager)
         # Format: {user_id: {'first_name': str, 'last_name': str, 'username': str, 'student_number': str, 'is_valid': str}}
         self.sheet_cache: Dict[int, Dict[str, str]] = {}
         self.sheet_cache_last_update: Optional[datetime] = None
@@ -1876,49 +1880,43 @@ class EnhancedCouncilBot:
         self.user_message_counts[user_id][timestamp] += 1
         self.user_last_message[user_id] = now
     
-    def refresh_sheet_cache(self) -> bool:
-        """Refresh local cache from Google Sheets
-        Returns True if successful, False otherwise"""
+    def refresh_sheet_cache(self) -> Dict[str, List[int]]:
+        """Refresh local cache from Google Sheets using SheetCacheManager and detect changes
+        Returns dictionary with change information (added, modified, removed, to_restore, to_restrict)"""
         try:
             if not self.sheet:
                 logger.warning("Google Sheets not initialized")
-                return False
+                return {'added': [], 'modified': [], 'removed': [], 'to_restore': [], 'to_restrict': []}
             
             logger.info("🔄 Refreshing sheet cache from Google Sheets...")
             # Get all values from the sheet
             all_values = self.sheet.get_all_values()
             
-            new_cache: Dict[int, Dict[str, str]] = {}
+            # Update cache using cache manager (will detect changes automatically)
+            changes = self.cache_manager.update_cache(all_values)
             
-            for idx, row in enumerate(all_values, start=1):
-                if row and len(row) >= 6:  # At least 6 columns (A-F)
-                    try:
-                        # Column A: Telegram ID, B: First Name, C: Last Name, D: Username, E: Student Number, F: is_valid
-                        telegram_id = str(row[0]).strip()
-                        if telegram_id:
-                            try:
-                                user_id = int(telegram_id)
-                                new_cache[user_id] = {
-                                    'first_name': str(row[1]).strip() if len(row) > 1 else "",
-                                    'last_name': str(row[2]).strip() if len(row) > 2 else "",
-                                    'username': str(row[3]).strip() if len(row) > 3 else "",
-                                    'student_number': str(row[4]).strip() if len(row) > 4 else "",
-                                    'is_valid': str(row[5]).strip() if len(row) > 5 else "0"
-                                }
-                            except ValueError:
-                                continue
-                    except (ValueError, IndexError) as e:
-                        logger.debug(f"Error parsing row {idx}: {e}")
-                        continue
-            
-            self.sheet_cache = new_cache
+            # Update legacy cache for backward compatibility
+            self.sheet_cache = self.cache_manager.get_cache()
             self.sheet_cache_last_update = datetime.now()
-            logger.info(f"✅ Sheet cache refreshed: {len(new_cache)} users cached")
-            return True
+            
+            # Log changes
+            if changes['added']:
+                logger.info(f"✅ Added {len(changes['added'])} new users: {changes['added'][:5]}..." if len(changes['added']) > 5 else f"✅ Added {len(changes['added'])} new users: {changes['added']}")
+            if changes['modified']:
+                logger.info(f"✅ Modified {len(changes['modified'])} users: {changes['modified'][:5]}..." if len(changes['modified']) > 5 else f"✅ Modified {len(changes['modified'])} users: {changes['modified']}")
+            if changes['removed']:
+                logger.info(f"✅ Removed {len(changes['removed'])} users: {changes['removed'][:5]}..." if len(changes['removed']) > 5 else f"✅ Removed {len(changes['removed'])} users: {changes['removed']}")
+            if changes['to_restore']:
+                logger.info(f"🔓 Need to restore permissions for {len(changes['to_restore'])} users")
+            if changes['to_restrict']:
+                logger.info(f"🔒 Need to restrict permissions for {len(changes['to_restrict'])} users")
+            
+            logger.info(f"✅ Sheet cache refreshed: {len(self.sheet_cache)} users cached")
+            return changes
             
         except Exception as e:
             logger.error(f"Error refreshing sheet cache: {e}")
-            return False
+            return {'added': [], 'modified': [], 'removed': [], 'to_restore': [], 'to_restrict': []}
     
     def get_all_users_from_sheet(self, use_cache: bool = True) -> dict:
         """Get all users from cache or Google Sheets with their is_valid status
@@ -2181,21 +2179,15 @@ class EnhancedCouncilBot:
                 # Refresh cache after adding new members
                 self.refresh_sheet_cache()
             
-            # Step 2: Refresh cache from Google Sheets (only if cache is stale or doesn't exist)
-            logger.info("Step 2: Refreshing sheet cache...")
-            old_cache = self.sheet_cache.copy() if self.sheet_cache else {}
-            cache_refreshed = self.refresh_sheet_cache()
+            # Step 2: Refresh cache from Google Sheets and get changes automatically
+            logger.info("Step 2: Refreshing sheet cache and detecting changes...")
+            changes = self.refresh_sheet_cache()
             
-            if not cache_refreshed:
-                logger.warning("Failed to refresh cache, using old cache if available")
-                if not old_cache:
-                    logger.error("No cache available, skipping permission check")
-                    return
+            if not changes:
+                logger.error("Failed to refresh cache, skipping permission check")
+                return
             
-            # Step 3: Compare old and new cache to find changes
-            logger.info("Step 3: Comparing cache to find changes...")
-            changes = self._find_permission_changes(old_cache, self.sheet_cache)
-            
+            # Step 3: Check if any changes detected
             if not changes['to_restore'] and not changes['to_restrict']:
                 logger.info("✅ No permission changes detected, all permissions are up to date")
                 return
@@ -2296,9 +2288,13 @@ class EnhancedCouncilBot:
         return changes
     
     def is_user_in_sheet(self, user_id: int) -> bool:
-        """Check if a user ID exists in Google Sheet (Column A) - uses cache if available"""
+        """Check if a user ID exists in Google Sheet (Column A) - uses cache manager"""
         try:
-            # Use cache if available
+            # Use cache manager first (most efficient)
+            if self.cache_manager.is_user_in_cache(user_id):
+                return True
+            
+            # Fallback to legacy cache if available
             if self.sheet_cache:
                 return user_id in self.sheet_cache
             
@@ -2349,14 +2345,21 @@ class EnhancedCouncilBot:
             self.sheet.append_row(new_row)
             logger.info(f"Added user {user_id} to sheet: {first_name} {last_name} (@{username})")
             
-            # Update cache
-            self.sheet_cache[user_id] = {
-                'first_name': first_name,
-                'last_name': last_name,
-                'username': username,
-                'student_number': '',
-                'is_valid': '0'
-            }
+            # Immediately refresh cache to include the new user
+            # This ensures the cache is always in sync with the sheet
+            try:
+                self.refresh_sheet_cache()
+                logger.info(f"✅ Cache refreshed after adding user {user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to refresh cache after adding user: {e}")
+                # Fallback: manually update cache
+                self.sheet_cache[user_id] = {
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'username': username,
+                    'student_number': '',
+                    'is_valid': '0'
+                }
             
             return True
             
