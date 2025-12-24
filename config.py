@@ -37,6 +37,14 @@ class Config:
     # Channel Configuration
     CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0')) or None
     
+    # Group Configuration
+    GROUP_ID = os.getenv('GROUP_ID')  # Group ID for @shora_sharif
+    
+    # Pyrogram Configuration (for getting group members)
+    PYROGRAM_API_ID = os.getenv('PYROGRAM_API_ID')
+    PYROGRAM_API_HASH = os.getenv('PYROGRAM_API_HASH')
+    PYROGRAM_SESSION_NAME = os.getenv('PYROGRAM_SESSION_NAME', 'pyrogram_session')
+    
     @classmethod
     def validate_config(cls):
         """Validate that all required configuration is present"""

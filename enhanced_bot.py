@@ -6,17 +6,25 @@ import sys
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, ChatPermissions
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters, ConversationHandler
 )
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
 from database import Database
 from config import Config
 import gspread
 from google.oauth2.service_account import Credentials
+
+# Pyrogram for getting group members
+try:
+    from pyrogram import Client
+    PYROGRAM_AVAILABLE = True
+except ImportError:
+    PYROGRAM_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -43,9 +51,28 @@ class EnhancedCouncilBot:
         # Channel ID for logging all messages
         self.CHANNEL_ID = Config.CHANNEL_ID  # Get from config
         
+        # Group ID for @shora_sharif
+        self.GROUP_ID = Config.GROUP_ID
+        
         # Google Sheets connection
         self.sheet = None
         self.init_google_sheets()
+        
+        # Pyrogram client for getting group members
+        # Use bot token instead of user account to avoid phone number authentication
+        self.pyrogram_client = None
+        if PYROGRAM_AVAILABLE and Config.PYROGRAM_API_ID and Config.PYROGRAM_API_HASH and Config.TELEGRAM_BOT_TOKEN:
+            try:
+                self.pyrogram_client = Client(
+                    Config.PYROGRAM_SESSION_NAME,
+                    api_id=int(Config.PYROGRAM_API_ID),
+                    api_hash=Config.PYROGRAM_API_HASH,
+                    bot_token=Config.TELEGRAM_BOT_TOKEN  # Use bot token to avoid phone auth
+                )
+                logger.info("Pyrogram client initialized with bot token for group member syncing")
+            except Exception as e:
+                logger.warning(f"Could not initialize Pyrogram client: {e}")
+                self.pyrogram_client = None
         
         # Load message mappings from database on startup
         self.load_message_mappings()
@@ -1564,6 +1591,9 @@ class EnhancedCouncilBot:
             # Add debug command
             application.add_handler(CommandHandler('debug', self.debug_info))
             
+            # Add command to manually check and restore chat permissions (admin only)
+            application.add_handler(CommandHandler('restore_permissions', self.manual_restore_permissions))
+            
             # Add handler for admin replies (from any user) - with highest priority
             application.add_handler(
                 MessageHandler(
@@ -1590,6 +1620,27 @@ class EnhancedCouncilBot:
                 ),
                 group=0  # High priority
             )
+            
+            # Add periodic job to check and restore chat permissions for valid users (every hour)
+            if self.GROUP_ID:
+                job_queue = application.job_queue
+                if job_queue:
+                    # Run immediately on startup
+                    job_queue.run_once(
+                        self.check_and_restore_chat_permissions,
+                        when=5  # Run after 5 seconds (to ensure bot is fully started)
+                    )
+                    # Then run every hour
+                    job_queue.run_repeating(
+                        self.check_and_restore_chat_permissions,
+                        interval=86400,  # 1 hour in seconds
+                        first=86405  # Start after first run + 5 seconds
+                    )
+                    logger.info(f"✅ Chat permissions job scheduled: immediate run + every hour for group {self.GROUP_ID}")
+                else:
+                    logger.error("❌ JobQueue is not available! Make sure python-telegram-bot[job-queue] is installed.")
+            else:
+                logger.warning(f"⚠️ GROUP_ID not set: {self.GROUP_ID}. Permission checking jobs will not run.")
             
             # Start the bot
             logger.info("Starting Enhanced Council Bot...")
@@ -1697,6 +1748,432 @@ class EnhancedCouncilBot:
         
         self.user_message_counts[user_id][timestamp] += 1
         self.user_last_message[user_id] = now
+    
+    def get_all_users_from_sheet(self) -> dict:
+        """Get all users from Google Sheets with their is_valid status
+        Returns: dict with 'valid' (list of user_ids with is_valid=1) and 'invalid' (list of user_ids with is_valid=0)
+        """
+        result = {'valid': [], 'invalid': []}
+        
+        try:
+            if not self.sheet:
+                logger.warning("Google Sheets not initialized")
+                return result
+            
+            # Get all values from the sheet
+            all_values = self.sheet.get_all_values()
+            
+            for idx, row in enumerate(all_values, start=1):
+                if row and len(row) >= 6:  # At least 6 columns (A-F)
+                    try:
+                        # Column A is Telegram ID, Column F (index 5) is is_valid
+                        telegram_id = str(row[0]).strip()
+                        is_valid = str(row[5]).strip() if len(row) > 5 else "0"
+                        
+                        if telegram_id:
+                            try:
+                                user_id = int(telegram_id)
+                                if is_valid == "1":
+                                    result['valid'].append(user_id)
+                                else:
+                                    result['invalid'].append(user_id)
+                            except ValueError:
+                                continue
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"Error parsing row {idx}: {e}")
+                        continue
+            
+            logger.info(f"Found {len(result['valid'])} valid users (is_valid=1) and {len(result['invalid'])} invalid users (is_valid=0) in Google Sheets")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error reading Google Sheets: {e}")
+            return result
+    
+    def get_valid_users_from_sheet(self) -> list:
+        """Get list of user IDs from Google Sheets where is_valid (column F) is 1"""
+        all_users = self.get_all_users_from_sheet()
+        return all_users['valid']
+    
+    async def restore_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Restore chat permissions (send messages and media) for a user"""
+        if not self.GROUP_ID:
+            logger.warning("GROUP_ID not configured, skipping permission restore")
+            return False
+        
+        try:
+            # Create permissions that allow sending text messages, media, stickers, gifs, polls, links, and adding users
+            permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,  # Send polls
+                can_send_other_messages=True,  # Send stickers & gifs
+                can_add_web_page_previews=True,  # Embed links
+                can_invite_users=True,  # Add users
+                can_change_info=False,
+                can_pin_messages=False
+            )
+            
+            # Restore permissions using restrict_chat_member
+            await context.bot.restrict_chat_member(
+                chat_id=self.GROUP_ID,
+                user_id=user_id,
+                permissions=permissions
+            )
+            
+            logger.info(f"Restored chat permissions for user {user_id} in group {self.GROUP_ID}")
+            return True
+            
+        except TelegramError as e:
+            # User might not be in the group, or bot doesn't have permission
+            if "not enough rights" in str(e).lower() or "chat not found" in str(e).lower():
+                logger.warning(f"Bot doesn't have permission to restrict members in group {self.GROUP_ID}: {e}")
+            elif "user not found" in str(e).lower() or "not a member" in str(e).lower():
+                logger.debug(f"User {user_id} not found or not a member: {e}")
+            else:
+                logger.debug(f"Error restoring permissions for user {user_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error restoring permissions for user {user_id}: {e}")
+            return False
+    
+    async def restrict_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Restrict chat permissions (close all permissions) for a user"""
+        if not self.GROUP_ID:
+            logger.warning("GROUP_ID not configured, skipping permission restrict")
+            return False
+        
+        try:
+            # Create permissions that restrict everything
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_invite_users=False,
+                can_change_info=False,
+                can_pin_messages=False
+            )
+            
+            # Restrict permissions using restrict_chat_member
+            await context.bot.restrict_chat_member(
+                chat_id=self.GROUP_ID,
+                user_id=user_id,
+                permissions=permissions
+            )
+            
+            logger.info(f"Restricted chat permissions for user {user_id} in group {self.GROUP_ID}")
+            return True
+            
+        except TelegramError as e:
+            # User might not be in the group, or bot doesn't have permission
+            if "not enough rights" in str(e).lower() or "chat not found" in str(e).lower():
+                logger.warning(f"Bot doesn't have permission to restrict members in group {self.GROUP_ID}: {e}")
+            elif "user not found" in str(e).lower() or "not a member" in str(e).lower():
+                logger.debug(f"User {user_id} not found or not a member: {e}")
+            else:
+                logger.debug(f"Error restricting permissions for user {user_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error restricting permissions for user {user_id}: {e}")
+            return False
+    
+    async def sync_group_members_to_sheet(self, context: ContextTypes.DEFAULT_TYPE):
+        """Sync group members to sheet - add members who are in group but not in sheet"""
+        logger.info(f"[SYNC] Starting sync - GROUP_ID: {self.GROUP_ID}, sheet available: {self.sheet is not None}")
+        if not self.GROUP_ID or not self.sheet:
+            logger.warning(f"[SYNC] Cannot sync - GROUP_ID={self.GROUP_ID}, sheet={self.sheet is not None}")
+            return 0
+        
+        try:
+            # Get all current members from the group using Pyrogram
+            group_members = []
+            
+            if self.pyrogram_client:
+                try:
+                    # Use Pyrogram to get all members
+                    await self.pyrogram_client.start()
+                    chat = await self.pyrogram_client.get_chat(self.GROUP_ID)
+                    logger.info(f"Fetching members from group: {chat.title}")
+                    
+                    async for member in self.pyrogram_client.get_chat_members(chat.id):
+                        if member.user and not member.user.is_bot:
+                            group_members.append({
+                                'user_id': member.user.id,
+                                'first_name': member.user.first_name or "",
+                                'last_name': member.user.last_name or "",
+                                'username': member.user.username or ""
+                            })
+                    
+                    await self.pyrogram_client.stop()
+                    logger.info(f"Found {len(group_members)} members in group {self.GROUP_ID} using Pyrogram")
+                except Exception as e:
+                    logger.error(f"Error getting members with Pyrogram: {e}")
+                    if self.pyrogram_client.is_connected:
+                        await self.pyrogram_client.stop()
+            else:
+                # Fallback: try to get administrators if Pyrogram is not available
+                logger.warning("Pyrogram not available, trying to get administrators as fallback")
+                try:
+                    admins = await context.bot.get_chat_administrators(self.GROUP_ID)
+                    for admin in admins:
+                        if admin.user and not admin.user.is_bot:
+                            group_members.append({
+                                'user_id': admin.user.id,
+                                'first_name': admin.user.first_name or "",
+                                'last_name': admin.user.last_name or "",
+                                'username': admin.user.username or ""
+                            })
+                    logger.info(f"Found {len(group_members)} administrators (fallback mode)")
+                except Exception as e:
+                    logger.error(f"Error getting administrators: {e}")
+                    return 0
+            
+            # Get all users currently in sheet
+            all_values = self.sheet.get_all_values()
+            sheet_user_ids = set()
+            for row in all_values:
+                if row and len(row) > 0:
+                    try:
+                        user_id = str(row[0]).strip()
+                        if user_id:
+                            sheet_user_ids.add(int(user_id))
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Add members who are in group but not in sheet
+            added_count = 0
+            for member in group_members:
+                if member['user_id'] not in sheet_user_ids:
+                    try:
+                        new_row = [
+                            str(member['user_id']),      # Column A: Telegram ID
+                            member['first_name'],        # Column B: First Name
+                            member['last_name'],         # Column C: Last Name
+                            member['username'],          # Column D: Username
+                            "",                          # Column E: Student Number (empty)
+                            "0"                          # Column F: is_valid (default 0)
+                        ]
+                        self.sheet.append_row(new_row)
+                        added_count += 1
+                        logger.info(f"Added new member to sheet: {member['user_id']} ({member['first_name']})")
+                    except Exception as e:
+                        logger.error(f"Error adding member {member['user_id']} to sheet: {e}")
+            
+            if added_count > 0:
+                logger.info(f"Added {added_count} new members to sheet")
+            
+            return added_count
+            
+        except TelegramError as e:
+            logger.error(f"Error getting group members: {e}")
+            return 0
+        except Exception as e:
+            logger.error(f"Error syncing group members to sheet: {e}")
+            return 0
+    
+    async def check_and_restore_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE):
+        """Periodic job to check and update chat permissions based on is_valid status"""
+        logger.info("=" * 50)
+        logger.info("Starting check_and_restore_chat_permissions job")
+        logger.info("=" * 50)
+        logger.info("Running periodic check for all users to update chat permissions...")
+        logger.info("Step 1: Syncing group members to sheet...")
+        
+        if not self.GROUP_ID:
+            logger.warning("GROUP_ID not configured, skipping permission check")
+            logger.warning(f"GROUP_ID value: {self.GROUP_ID}")
+            return
+        
+        logger.info(f"GROUP_ID is set: {self.GROUP_ID}")
+        logger.info(f"Sheet initialized: {self.sheet is not None}")
+        logger.info(f"Pyrogram client available: {self.pyrogram_client is not None}")
+        
+        try:
+            # Step 1: Sync group members to sheet (add members in group but not in sheet)
+            added_count = await self.sync_group_members_to_sheet(context)
+            if added_count > 0:
+                logger.info(f"Added {added_count} new members to sheet")
+            
+            # Step 2: Get all users from sheet with their is_valid status
+            logger.info("Step 2: Getting users from sheet and updating permissions...")
+            all_users = self.get_all_users_from_sheet()
+            valid_users = all_users['valid']
+            invalid_users = all_users['invalid']
+            
+            # Filter: Only process users who are actually in the group
+            # Get group members using Pyrogram
+            group_member_ids = set()
+            if self.pyrogram_client:
+                try:
+                    await self.pyrogram_client.start()
+                    chat = await self.pyrogram_client.get_chat(self.GROUP_ID)
+                    async for member in self.pyrogram_client.get_chat_members(chat.id):
+                        if member.user and not member.user.is_bot:
+                            group_member_ids.add(member.user.id)
+                    await self.pyrogram_client.stop()
+                    logger.info(f"Got {len(group_member_ids)} group members for filtering")
+                except Exception as e:
+                    logger.warning(f"Could not get group members with Pyrogram: {e}")
+                    if self.pyrogram_client.is_connected:
+                        await self.pyrogram_client.stop()
+                    # Continue anyway, will fail gracefully during permission update
+            else:
+                logger.warning("Pyrogram not available, cannot filter by group membership")
+            
+            # Filter users to only those in the group
+            valid_users_in_group = [uid for uid in valid_users if not group_member_ids or uid in group_member_ids]
+            invalid_users_in_group = [uid for uid in invalid_users if not group_member_ids or uid in group_member_ids]
+            
+            if not valid_users_in_group and not invalid_users_in_group:
+                logger.info("No users found in sheet that are in the group")
+                return
+            
+            restored_count = 0
+            restricted_count = 0
+            error_count = 0
+            
+            # Restore permissions for users with is_valid=1 (only if in group)
+            for user_id in valid_users_in_group:
+                try:
+                    success = await self.restore_chat_permissions(context, user_id)
+                    if success:
+                        restored_count += 1
+                    
+                    # Small delay to avoid rate limiting
+                    import asyncio
+                    await asyncio.sleep(0.2)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing valid user {user_id}: {e}")
+                    error_count += 1
+            
+            # Restrict permissions for users with is_valid=0 (only if in group)
+            for user_id in invalid_users_in_group:
+                try:
+                    success = await self.restrict_chat_permissions(context, user_id)
+                    if success:
+                        restricted_count += 1
+                    
+                    # Small delay to avoid rate limiting
+                    import asyncio
+                    await asyncio.sleep(0.2)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing invalid user {user_id}: {e}")
+                    error_count += 1
+            
+            if restored_count > 0 or restricted_count > 0:
+                logger.info(f"Successfully updated permissions: {restored_count} users restored, {restricted_count} users restricted in group {self.GROUP_ID}")
+            
+        except Exception as e:
+            logger.error(f"Error in check_and_restore_chat_permissions: {e}")
+    
+    async def manual_restore_permissions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manual command to check and update chat permissions based on is_valid status (admin only)"""
+        user = update.effective_user
+        
+        if not self.is_admin_user(user.id):
+            await update.message.reply_text("❌ این دستور فقط برای ادمین‌ها قابل استفاده است.")
+            return
+        
+        await update.message.reply_text("🔄 در حال بررسی همه کاربران و به‌روزرسانی دسترسی‌ها...")
+        
+        if not self.GROUP_ID:
+            await update.message.reply_text("❌ GROUP_ID تنظیم نشده است.")
+            return
+        
+        try:
+            # Step 1: Sync group members to sheet
+            await update.message.reply_text("📋 مرحله 1: همگام‌سازی اعضای گروه با شیت...")
+            added_count = await self.sync_group_members_to_sheet(context)
+            if added_count > 0:
+                await update.message.reply_text(f"✅ {added_count} عضو جدید به شیت اضافه شد.")
+            
+            # Step 2: Get all users from sheet
+            await update.message.reply_text("📋 مرحله 2: دریافت کاربران از شیت...")
+            all_users = self.get_all_users_from_sheet()
+            valid_users = all_users['valid']
+            invalid_users = all_users['invalid']
+            
+            # Get group members for filtering
+            group_member_ids = set()
+            try:
+                async for member in context.bot.get_chat_members(self.GROUP_ID):
+                    if member.user and not member.user.is_bot:
+                        group_member_ids.add(member.user.id)
+            except Exception as e:
+                logger.warning(f"Could not get group members for filtering: {e}")
+            
+            # Filter users to only those in the group
+            valid_users_in_group = [uid for uid in valid_users if not group_member_ids or uid in group_member_ids]
+            invalid_users_in_group = [uid for uid in invalid_users if not group_member_ids or uid in group_member_ids]
+            
+            if not valid_users_in_group and not invalid_users_in_group:
+                await update.message.reply_text("✅ هیچ کاربری در شیت که در گروه باشد یافت نشد.")
+                return
+            
+            await update.message.reply_text(
+                f"📋 یافت شد:\n"
+                f"✅ کاربران معتبر در گروه (is_valid=1): {len(valid_users_in_group)}\n"
+                f"❌ کاربران نامعتبر در گروه (is_valid=0): {len(invalid_users_in_group)}\n\n"
+                f"در حال به‌روزرسانی دسترسی‌ها..."
+            )
+            
+            restored_count = 0
+            restricted_count = 0
+            error_count = 0
+            
+            # Restore permissions for users with is_valid=1 (only if in group)
+            for user_id in valid_users_in_group:
+                try:
+                    success = await self.restore_chat_permissions(context, user_id)
+                    if success:
+                        restored_count += 1
+                    
+                    import asyncio
+                    await asyncio.sleep(0.2)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing valid user {user_id}: {e}")
+                    error_count += 1
+            
+            # Restrict permissions for users with is_valid=0 (only if in group)
+            for user_id in invalid_users_in_group:
+                try:
+                    success = await self.restrict_chat_permissions(context, user_id)
+                    if success:
+                        restricted_count += 1
+                    
+                    import asyncio
+                    await asyncio.sleep(0.2)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing invalid user {user_id}: {e}")
+                    error_count += 1
+            
+            await update.message.reply_text(
+                f"✅ به‌روزرسانی دسترسی‌ها انجام شد.\n\n"
+                f"📊 آمار:\n"
+                f"✅ دسترسی باز شده: {restored_count} کاربر\n"
+                f"❌ دسترسی بسته شده: {restricted_count} کاربر\n"
+                f"⚠️ خطا: {error_count}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in manual_restore_permissions: {e}")
+            await update.message.reply_text(f"❌ خطا: {str(e)}")
 
 if __name__ == '__main__':
     bot = EnhancedCouncilBot()
