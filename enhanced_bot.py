@@ -39,6 +39,7 @@ CHOOSING_ROLE, WAITING_FOR_MESSAGE, WAITING_FOR_STUDENT_NUMBER = range(3)
 
 class EnhancedCouncilBot:
     def __init__(self):
+        self.FIRST_RUN_NO_CACHE = True
         self.db = Database(Config.DATABASE_PATH)
         self.user_states: Dict[int, Dict[str, Any]] = {}
         self.message_thread_map: Dict[int, int] = {}  # Maps telegram message_id to thread_id
@@ -2157,11 +2158,76 @@ class EnhancedCouncilBot:
         except Exception as e:
             logger.error(f"Error syncing group members to sheet: {e}")
             return 0
-    
+    async def apply_permissions_from_sheet_direct(self, context):
+        """
+        Apply permissions directly from Google Sheet
+        WITHOUT using cache at all
+        """
+
+        if not self.sheet or not self.GROUP_ID:
+            logger.warning("Sheet or GROUP_ID not available")
+            return
+
+        # Get all sheet rows
+        rows = self.sheet.get_all_values()
+
+        # Get group members (to avoid restricting non-members)
+        group_members = set()
+        if self.pyrogram_client:
+            try:
+                await self.pyrogram_client.start()
+                async for m in self.pyrogram_client.get_chat_members(self.GROUP_ID):
+                    if m.user and not m.user.is_bot:
+                        group_members.add(m.user.id)
+                await self.pyrogram_client.stop()
+            except Exception:
+                if self.pyrogram_client.is_connected:
+                    await self.pyrogram_client.stop()
+
+        restore_list = []
+        restrict_list = []
+
+        for row in rows:
+            if len(row) < 6:
+                continue
+
+            try:
+                user_id = int(row[0])
+                is_valid = str(row[5]).strip()
+            except:
+                continue
+
+            if group_members and user_id not in group_members:
+                continue
+
+            if is_valid == "1":
+                restore_list.append(user_id)
+            else:
+                restrict_list.append(user_id)
+
+        logger.info(f"[FIRST RUN] Restore: {len(restore_list)}, Restrict: {len(restrict_list)}")
+
+        import asyncio
+        for uid in restore_list:
+            await self.restore_chat_permissions(context, uid)
+            await asyncio.sleep(0.15)
+
+        for uid in restrict_list:
+            await self.restrict_chat_permissions(context, uid)
+            await asyncio.sleep(0.15)
+
     async def check_and_restore_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE):
         """Periodic job to check and update chat permissions based on is_valid status
         This runs in background via job queue and doesn't block the bot
         Uses local cache and only applies changes"""
+        if self.FIRST_RUN_NO_CACHE:
+            logger.info("🆕 FIRST RUN: applying permissions directly from sheet (NO CACHE)")
+            await self.apply_permissions_from_sheet_direct(context)
+            logger.info("✅ FIRST RUN permission apply finished, building cache...")
+            self.refresh_sheet_cache()
+            self.FIRST_RUN_NO_CACHE = False
+            return
+
         logger.info("=" * 50)
         logger.info("Starting check_and_restore_chat_permissions job (background - non-blocking)")
         logger.info("=" * 50)
