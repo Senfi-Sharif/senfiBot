@@ -2432,7 +2432,14 @@ class EnhancedCouncilBot:
         except Exception as e:
             logger.error(f"Error adding user to sheet: {e}")
             return False
-    
+    async def ensure_user_is_restricted(self, context, user_id):
+        try:
+            await self.restrict_chat_permissions(context, user_id)
+            logger.info(f"🔒 Ensured restriction for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to ensure restriction: {e}")
+
+        
     async def handle_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle messages in the group - check if user is in Google Sheet (handles all message types including replies, media, etc.)
         This handler silently deletes messages from unauthorized users and restricts their access - no replies or messages sent."""
@@ -2474,7 +2481,7 @@ class EnhancedCouncilBot:
         is_in_sheet = self.is_user_in_sheet(user_id)
         logger.info(f"📊 User {user_id} in sheet: {is_in_sheet}")
         
-        if not is_in_sheet:
+        if not is_in_sheet or not self.is_user_restricted(user_id):
             logger.warning(f"⚠️ User {user_id} (@{username}) NOT found in sheet, deleting message and restricting access")
             
             try:
