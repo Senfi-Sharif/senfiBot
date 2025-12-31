@@ -4,6 +4,7 @@ import sqlite3
 import fcntl
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, ChatPermissions
@@ -1988,6 +1989,11 @@ class EnhancedCouncilBot:
             )
             
             logger.info(f"Restored chat permissions for user {user_id} in group {self.GROUP_ID}")
+            # Mark access opened time in sheet (Iran time) so admins can see when access was granted
+            try:
+                await self.mark_access_opened_in_sheet(context, user_id)
+            except Exception as e:
+                logger.warning(f"Failed to mark access opened for {user_id} after restoring permissions: {e}")
             return True
             
         except TelegramError as e:
@@ -2048,6 +2054,54 @@ class EnhancedCouncilBot:
             return False
         except Exception as e:
             logger.error(f"Unexpected error restricting permissions for user {user_id}: {e}")
+            return False
+
+    async def is_user_restricted(self, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+        """Check if user is currently restricted from sending messages in group"""
+        if not self.GROUP_ID:
+            logger.warning("GROUP_ID not configured, cannot check restriction status")
+            return False
+        try:
+            member = await context.bot.get_chat_member(self.GROUP_ID, user_id)
+            status = getattr(member, 'status', None)
+            if status == 'restricted':
+                # ChatMemberRestricted exposes permission attributes like can_send_messages
+                perms = getattr(member, 'can_send_messages', None)
+                if perms is not None:
+                    return not perms
+                return True
+            if status in ('left', 'kicked'):
+                # Treat non-members as effectively restricted
+                return True
+            # For normal members/admins/creator -> not restricted
+            return False
+        except Exception as e:
+            logger.warning(f"Could not determine restriction status for {user_id}: {e}")
+            return False
+
+    async def mark_access_opened_in_sheet(self, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+        """Write Iran time to column J for a user when access is opened"""
+        if not self.sheet:
+            logger.warning("Google Sheets not initialized, cannot mark access opened")
+            return False
+        try:
+            all_values = self.sheet.get_all_values()
+            for idx, row in enumerate(all_values, start=1):
+                if row and len(row) > 0 and str(row[0]).strip() == str(user_id):
+                    iran_now = datetime.now(ZoneInfo('Asia/Tehran'))
+                    ts = iran_now.strftime("%Y-%m-%d %H:%M:%S")
+                    # Column J is index 10
+                    self.sheet.update_cell(idx, 10, ts)
+                    logger.info(f"Marked access opened for user {user_id} in sheet at {ts}")
+                    try:
+                        self.refresh_sheet_cache()
+                    except Exception:
+                        logger.warning("Failed to refresh cache after marking access opened")
+                    return True
+            logger.warning(f"User {user_id} not found in sheet to mark access opened")
+            return False
+        except Exception as e:
+            logger.error(f"Error marking access opened for user {user_id}: {e}")
             return False
     
     async def sync_group_members_to_sheet(self, context: ContextTypes.DEFAULT_TYPE):
@@ -2247,6 +2301,9 @@ class EnhancedCouncilBot:
             
             # Step 2: Refresh cache from Google Sheets and get changes automatically
             logger.info("Step 2: Refreshing sheet cache and detecting changes...")
+            # Log current cache age for debugging (may be None if no cache)
+            cache_age = self.cache_manager.get_cache_age()
+            logger.info(f"Current cache age (seconds): {cache_age}")
             changes = self.refresh_sheet_cache()
             
             if not changes:
@@ -2480,39 +2537,65 @@ class EnhancedCouncilBot:
         logger.info(f"🔍 Checking if user {user_id} is in sheet...")
         is_in_sheet = self.is_user_in_sheet(user_id)
         logger.info(f"📊 User {user_id} in sheet: {is_in_sheet}")
-        
-        if not is_in_sheet or not self.is_user_restricted(user_id):
-            logger.warning(f"⚠️ User {user_id} (@{username}) NOT found in sheet, deleting message and restricting access")
-            
+
+        # Determine is_valid status (prefer cache for speed)
+        is_valid = None
+        try:
+            if is_in_sheet:
+                if self.cache_manager.is_user_in_cache(user_id):
+                    is_valid = self.cache_manager.is_user_valid(user_id)
+                    logger.info(f"📊 Cached is_valid for {user_id}: {is_valid}")
+                elif self.sheet_cache and user_id in self.sheet_cache:
+                    is_valid = self.sheet_cache[user_id].get('is_valid') == '1'
+                    logger.info(f"📊 Legacy cache is_valid for {user_id}: {is_valid}")
+                else:
+                    # As a fallback, try a direct sheet lookup (cheap for single user)
+                    try:
+                        if self.sheet:
+                            all_vals = self.sheet.get_all_values()
+                            for r in all_vals:
+                                if r and len(r) > 0 and str(r[0]).strip() == str(user_id):
+                                    is_valid = str(r[5]).strip() == '1' if len(r) > 5 else False
+                                    break
+                    except Exception as e:
+                        logger.warning(f"Error doing direct sheet lookup for {user_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Error determining is_valid for {user_id}: {e}")
+
+        # If user not present in sheet OR present but not marked valid -> delete and restrict
+        if not is_in_sheet or (is_in_sheet and not is_valid):
+            logger.warning(f"⚠️ User {user_id} (@{username}) not allowed (in_sheet={is_in_sheet}, is_valid={is_valid}), deleting message and restricting access")
+
             try:
                 # Delete the message silently (no error message to user)
                 logger.info(f"🗑️ Attempting to delete message from user {user_id}...")
                 await update.message.delete()
                 logger.info(f"✅ Deleted message from user {user_id}")
-                
+
                 # Restrict user permissions silently
                 logger.info(f"🔒 Attempting to restrict permissions for user {user_id}...")
                 await self.restrict_chat_permissions(context, user_id)
                 logger.info(f"✅ Restricted permissions for user {user_id}")
-                
-                # Add user to sheet silently
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                username = user.username or ""
-                logger.info(f"➕ Attempting to add user {user_id} to sheet...")
-                success = await self.add_user_to_sheet(user_id, first_name, last_name, username)
-                if success:
-                    logger.info(f"✅ Added user {user_id} (@{username}) to sheet")
-                else:
-                    logger.error(f"❌ Failed to add user {user_id} to sheet")
-                
+
+                # Add user to sheet silently if they were not present
+                if not is_in_sheet:
+                    first_name = user.first_name or ""
+                    last_name = user.last_name or ""
+                    username = user.username or ""
+                    logger.info(f"➕ Attempting to add user {user_id} to sheet...")
+                    success = await self.add_user_to_sheet(user_id, first_name, last_name, username)
+                    if success:
+                        logger.info(f"✅ Added user {user_id} (@{username}) to sheet")
+                    else:
+                        logger.error(f"❌ Failed to add user {user_id} to sheet")
+
                 # Return immediately to prevent any other handlers from processing this message
                 # No messages will be sent to the group
                 logger.info("=" * 60)
-                logger.info("✅ handle_group_message COMPLETED - message deleted, user restricted, added to sheet")
+                logger.info("✅ handle_group_message COMPLETED - message deleted, user restricted, added to sheet (if needed)")
                 logger.info("=" * 60)
                 return
-                
+
             except TelegramError as e:
                 logger.error(f"❌ TelegramError handling unauthorized user {user_id}: {e}")
                 import traceback
@@ -2526,7 +2609,7 @@ class EnhancedCouncilBot:
                 # Still return to prevent other handlers - no error messages sent
                 return
         else:
-            logger.info(f"✅ User {user_id} is in sheet, allowing message")
+            logger.info(f"✅ User {user_id} is in sheet and valid, allowing message")
             logger.info("=" * 60)
     
     async def manual_restore_permissions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
