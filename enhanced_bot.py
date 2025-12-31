@@ -3,6 +3,8 @@ import os
 import sqlite3
 import fcntl
 import sys
+import asyncio
+import html
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
@@ -85,6 +87,12 @@ class EnhancedCouncilBot:
         # Format: {user_id: {'first_name': str, 'last_name': str, 'username': str, 'student_number': str, 'is_valid': str}}
         self.sheet_cache: Dict[int, Dict[str, str]] = {}
         self.sheet_cache_last_update: Optional[datetime] = None
+
+        # Log forwarder (for sending all logs to Telegram channel)
+        self.log_queue: Optional[asyncio.Queue] = None
+        self.log_sender_task: Optional[asyncio.Task] = None
+        self.log_batch_interval: int = 10  # seconds between sending batches
+        self.log_batch_max: int = 50  # max messages per batch
         
         # Pyrogram client for getting group members
         # Use bot token instead of user account to avoid phone number authentication
@@ -105,19 +113,38 @@ class EnhancedCouncilBot:
         # Load message mappings from database on startup
         self.load_message_mappings()
     
-    async def send_to_channel(self, context: ContextTypes.DEFAULT_TYPE, message: str, parse_mode: str = 'HTML'):
-        """Send message to the logging channel (optional - silently fails if channel not available)"""
+    async def send_to_channel(self, context: Optional[ContextTypes.DEFAULT_TYPE], message: str, parse_mode: str = 'HTML'):
+        """Send message to the logging channel (optional - silently fails if channel not available)
+        If context is None, a bot instance set on self.bot (in post_init) will be used."""
         try:
-            # Skip channel logging if channel ID is invalid or not configured
+            # Determine bot to use
+            bot = None
+            if context and getattr(context, 'bot', None):
+                bot = context.bot
+            elif hasattr(self, 'bot') and getattr(self, 'bot', None):
+                bot = self.bot
+
+            # Skip channel logging if no bot or no channel configured
+            if not bot:
+                logger.info("Channel logging disabled - no bot instance available")
+                return
             if not hasattr(self, 'CHANNEL_ID') or not self.CHANNEL_ID or self.CHANNEL_ID == -1001234567890:
                 logger.info("Channel logging disabled - no valid channel configured")
                 return
-            
-            await context.bot.send_message(
-                chat_id=self.CHANNEL_ID,
-                text=message,
-                parse_mode=parse_mode
-            )
+
+            # Split long messages into Telegram-safe chunks and escape HTML
+            def _chunks(text, size=3800):
+                for i in range(0, len(text), size):
+                    yield text[i:i+size]
+
+            for chunk in _chunks(message):
+                escaped = html.escape(chunk)
+                await bot.send_message(
+                    chat_id=self.CHANNEL_ID,
+                    text=f"<pre>{escaped}</pre>",
+                    parse_mode=parse_mode
+                )
+
             logger.info(f"Message sent to channel {self.CHANNEL_ID}")
         except Exception as e:
             # Silently log channel errors - don't interrupt main functionality
@@ -1749,6 +1776,13 @@ class EnhancedCouncilBot:
                         logger.error("⚠️ Please set GROUP_ID in .env to the actual chat_id number (not username)")
                         return
                 
+                # Ensure we have a bot instance and start log forwarder
+                try:
+                    self.bot = application.bot
+                    self._setup_logging_forwarder(application)
+                except Exception as e:
+                    logger.warning(f"Failed to set up logging forwarder: {e}")
+
                 # Sync group members
                 if self.GROUP_ID:
                     logger.info("=" * 50)
@@ -2097,12 +2131,94 @@ class EnhancedCouncilBot:
                         self.refresh_sheet_cache()
                     except Exception:
                         logger.warning("Failed to refresh cache after marking access opened")
+                    # Notify channel about opened access
+                    try:
+                        msg = f"🔓 <b>Access opened</b>\n🕒 {ts}\n👤 User: {user_id}"
+                        await self.send_to_channel(context, msg, parse_mode='HTML')
+                    except Exception as e:
+                        logger.warning(f"Failed to send access-opened notification to channel: {e}")
                     return True
             logger.warning(f"User {user_id} not found in sheet to mark access opened")
             return False
         except Exception as e:
             logger.error(f"Error marking access opened for user {user_id}: {e}")
             return False
+
+    def _setup_logging_forwarder(self, application: Application):
+        """Set up a logging.Handler that enqueues all logs and start the sender task"""
+        # Store bot for send_to_channel fallback
+        self.bot = application.bot
+
+        # Initialize queue and background task
+        loop = asyncio.get_event_loop()
+        self.log_queue = asyncio.Queue()
+
+        class TelegramQueueHandler(logging.Handler):
+            def __init__(self, loop, queue):
+                super().__init__()
+                self.loop = loop
+                self.queue = queue
+
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    # Enqueue message in loop thread
+                    self.loop.call_soon_threadsafe(self.queue.put_nowait, f"[{record.levelname}] {msg}")
+                except Exception:
+                    pass
+
+        handler = TelegramQueueHandler(loop, self.log_queue)
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+
+        # Add handler to root logger
+        logging.getLogger().addHandler(handler)
+
+        # Start sender task
+        if not self.log_sender_task:
+            self.log_sender_task = asyncio.create_task(self._log_sender_loop())
+
+    async def _log_sender_loop(self):
+        """Background loop to batch logs and send them to Telegram channel"""
+        if not self.log_queue:
+            return
+        while True:
+            try:
+                batch = []
+                try:
+                    # Wait for first message (with timeout)
+                    msg = await asyncio.wait_for(self.log_queue.get(), timeout=self.log_batch_interval)
+                    batch.append(msg)
+                except asyncio.TimeoutError:
+                    pass
+
+                # Drain quickly up to max
+                while not self.log_queue.empty() and len(batch) < self.log_batch_max:
+                    batch.append(self.log_queue.get_nowait())
+
+                if not batch:
+                    continue
+
+                combined = "\n".join(batch)
+
+                # Split large messages into chunks
+                for chunk in self._split_message(combined):
+                    try:
+                        await self.send_to_channel(None, f"<pre>{html.escape(chunk)}</pre>", parse_mode='HTML')
+                    except Exception as e:
+                        logger.warning(f"Failed to send log chunk to channel: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in log sender loop: {e}")
+                await asyncio.sleep(5)
+
+    def _split_message(self, text: str, limit: int = 3800):
+        """Yield chunks of text under the given limit"""
+        for i in range(0, len(text), limit):
+            yield text[i:i+limit]
     
     async def sync_group_members_to_sheet(self, context: ContextTypes.DEFAULT_TYPE):
         """Sync group members to sheet - add members who are in group but not in sheet"""
@@ -2201,6 +2317,13 @@ class EnhancedCouncilBot:
                 logger.info(f"✅ [SYNC] Successfully added {added_count} new members to sheet")
                 # Refresh cache after adding new members
                 self.refresh_sheet_cache()
+                try:
+                    iran_now = datetime.now(ZoneInfo('Asia/Tehran')).strftime("%Y-%m-%d %H:%M:%S")
+                    sample = ', '.join(str(m['user_id']) for m in group_members[:5])
+                    msg = f"➕ <b>Added {added_count} members to sheet</b>\n🕒 {iran_now}\n📋 Sample: {sample}"
+                    await self.send_to_channel(context, msg, parse_mode='HTML')
+                except Exception as e:
+                    logger.warning(f"Failed to send sync summary to channel: {e}")
             else:
                 logger.info(f"[SYNC] No new members to add (all {len(group_members)} members already in sheet)")
             
@@ -2262,13 +2385,38 @@ class EnhancedCouncilBot:
         logger.info(f"[FIRST RUN] Restore: {len(restore_list)}, Restrict: {len(restrict_list)}")
 
         import asyncio
+        restored_count = 0
+        restricted_count = 0
         for uid in restore_list:
-            await self.restore_chat_permissions(context, uid)
+            try:
+                success = await self.restore_chat_permissions(context, uid)
+                if success:
+                    restored_count += 1
+                    try:
+                        await self.mark_access_opened_in_sheet(context, uid)
+                    except Exception as e:
+                        logger.warning(f"Failed to mark access opened for {uid} during FIRST RUN: {e}")
+            except Exception as e:
+                logger.error(f"Error restoring permissions for {uid} during FIRST RUN: {e}")
             await asyncio.sleep(0.15)
 
         for uid in restrict_list:
-            await self.restrict_chat_permissions(context, uid)
+            try:
+                success = await self.restrict_chat_permissions(context, uid)
+                if success:
+                    restricted_count += 1
+            except Exception as e:
+                logger.error(f"Error restricting permissions for {uid} during FIRST RUN: {e}")
             await asyncio.sleep(0.15)
+
+        logger.info(f"[FIRST RUN] Restored: {restored_count}, Restricted: {restricted_count}")
+        try:
+            iran_now = datetime.now(ZoneInfo('Asia/Tehran')).strftime("%Y-%m-%d %H:%M:%S")
+            msg = (f"🆕 <b>FIRST RUN permissions applied</b>\n🕒 {iran_now}\n"
+                   f"🔧 Restored: {restored_count}\n🔒 Restricted: {restricted_count}")
+            await self.send_to_channel(context, msg, parse_mode='HTML')
+        except Exception as e:
+            logger.warning(f"Failed to send FIRST RUN summary to channel: {e}")
 
     async def check_and_restore_chat_permissions(self, context: ContextTypes.DEFAULT_TYPE):
         """Periodic job to check and update chat permissions based on is_valid status
@@ -2316,6 +2464,18 @@ class EnhancedCouncilBot:
                 return
             
             logger.info(f"Found {len(changes['to_restore'])} users to restore, {len(changes['to_restrict'])} users to restrict")
+            
+            # Send summary to channel about job start
+            try:
+                cache_age = self.cache_manager.get_cache_age()
+                iran_now = datetime.now(ZoneInfo('Asia/Tehran')).strftime("%Y-%m-%d %H:%M:%S")
+                message = (f"🔄 <b>Permissions job started</b>\n"
+                           f"🕒 {iran_now}\n"
+                           f"🔍 Found: {len(changes['to_restore'])} to restore, {len(changes['to_restrict'])} to restrict\n"
+                           f"📋 Cache age (s): {cache_age}")
+                await self.send_to_channel(context, message, parse_mode='HTML')
+            except Exception as e:
+                logger.warning(f"Failed to post job-start to channel: {e}")
             
             # Step 4: Get group members to filter (only process users in group)
             group_member_ids = set()
@@ -2372,6 +2532,13 @@ class EnhancedCouncilBot:
             
             if restored_count > 0 or restricted_count > 0:
                 logger.info(f"✅ Successfully updated permissions: {restored_count} restored, {restricted_count} restricted")
+                try:
+                    iran_now = datetime.now(ZoneInfo('Asia/Tehran')).strftime("%Y-%m-%d %H:%M:%S")
+                    summary = (f"✅ <b>Permissions job finished</b>\n🕒 {iran_now}\n"
+                               f"🔧 Restored: {restored_count}\n🔒 Restricted: {restricted_count}")
+                    await self.send_to_channel(context, summary, parse_mode='HTML')
+                except Exception as e:
+                    logger.warning(f"Failed to send permissions summary to channel: {e}")
             
         except Exception as e:
             logger.error(f"Error in check_and_restore_chat_permissions: {e}")
