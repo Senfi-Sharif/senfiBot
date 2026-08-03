@@ -7,7 +7,7 @@ import asyncio
 import html
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, ChatPermissions
 from telegram.ext import (
@@ -36,6 +36,13 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Reduce httpx logging to avoid flood control issues with Telegram
+logging.getLogger('httpx').setLevel(logging.ERROR)
+logging.getLogger('httpx').propagate = False
+# Also reduce apscheduler logging
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
+logging.getLogger('apscheduler').propagate = False
 
 # Conversation states
 CHOOSING_ROLE, WAITING_FOR_MESSAGE, WAITING_FOR_STUDENT_NUMBER = range(3)
@@ -88,12 +95,23 @@ class EnhancedCouncilBot:
         self.sheet_cache: Dict[int, Dict[str, str]] = {}
         self.sheet_cache_last_update: Optional[datetime] = None
 
-        # Log forwarder (for sending all logs to Telegram channel)
+        # Log forwarder (for sending logs to Telegram channel)
         self.log_queue: Optional[asyncio.Queue] = None
         self.log_sender_task: Optional[asyncio.Task] = None
-        self.log_batch_interval: int = 10  # seconds between sending batches
-        self.log_batch_max: int = 50  # max messages per batch
-        
+        self.log_batch_interval: int = 300  # Send logs every 5 minutes (300 seconds)
+        self.log_batch_max: int = 5  # Maximum 5 messages per batch to reduce noise
+
+        # Access updates queue for batching Google Sheet
+        batching = Config.ACCESS_UPDATE_BATCHING if hasattr(Config, 'ACCESS_UPDATE_BATCHING') else True
+        if batching:
+            self.access_updates_queue: List[Tuple[int, str]] = []  # list of (user_id, timestamp_string)
+            self.access_update_lock = asyncio.Lock()
+            self.access_update_task: Optional[asyncio.Task] = None
+        else:
+            self.access_updates_queue = None
+            self.access_update_lock = None
+            self.access_update_task = None
+
         # Pyrogram client for getting group members
         # Use bot token instead of user account to avoid phone number authentication
         self.pyrogram_client = None
@@ -1819,6 +1837,12 @@ class EnhancedCouncilBot:
         except Exception as e:
             logger.error(f"Bot stopped due to error: {e}")
         finally:
+            # Clean up background tasks
+            if self.access_update_task and not self.access_update_task.done():
+                self.access_update_task.cancel()
+                # Don't wait for the task to finish - it will clean up on cancellation
+                # await self.access_update_task  # Removed to fix syntax error
+
             # Always release the lock when the bot stops
             self.release_lock()
     
@@ -2114,34 +2138,26 @@ class EnhancedCouncilBot:
             return False
 
     async def mark_access_opened_in_sheet(self, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-        """Write Iran time to column J for a user when access is opened"""
+        """Write Iran time to column J for a user when access is opened - queued for batch processing"""
         if not self.sheet:
             logger.warning("Google Sheets not initialized, cannot mark access opened")
             return False
         try:
-            all_values = self.sheet.get_all_values()
-            for idx, row in enumerate(all_values, start=1):
-                if row and len(row) > 0 and str(row[0]).strip() == str(user_id):
-                    iran_now = datetime.now(ZoneInfo('Asia/Tehran'))
-                    ts = iran_now.strftime("%Y-%m-%d %H:%M:%S")
-                    # Column J is index 10
-                    self.sheet.update_cell(idx, 10, ts)
-                    logger.info(f"Marked access opened for user {user_id} in sheet at {ts}")
-                    try:
-                        self.refresh_sheet_cache()
-                    except Exception:
-                        logger.warning("Failed to refresh cache after marking access opened")
-                    # Notify channel about opened access
-                    try:
-                        msg = f"🔓 <b>Access opened</b>\n🕒 {ts}\n👤 User: {user_id}"
-                        await self.send_to_channel(context, msg, parse_mode='HTML')
-                    except Exception as e:
-                        logger.warning(f"Failed to send access-opened notification to channel: {e}")
-                    return True
-            logger.warning(f"User {user_id} not found in sheet to mark access opened")
-            return False
+            iran_now = datetime.now(ZoneInfo('Asia/Tehran'))
+            ts = iran_now.strftime("%Y-%m-%d %H:%M:%S")
+
+            # Add to queue for batch processing
+            async with self.access_update_lock:
+                self.access_updates_queue.append((user_id, ts))
+                logger.info(f"Queued access update for user {user_id} at {ts} (queue size: {len(self.access_updates_queue)})")
+
+            # Start the batch processor if not already running
+            if not self.access_update_task or self.access_update_task.done():
+                self.access_update_task = asyncio.create_task(self._process_access_updates_loop())
+
+            return True
         except Exception as e:
-            logger.error(f"Error marking access opened for user {user_id}: {e}")
+            logger.error(f"Error queuing access opened for user {user_id}: {e}")
             return False
 
     def _setup_logging_forwarder(self, application: Application):
@@ -2161,9 +2177,11 @@ class EnhancedCouncilBot:
 
             def emit(self, record):
                 try:
-                    msg = self.format(record)
-                    # Enqueue message in loop thread
-                    self.loop.call_soon_threadsafe(self.queue.put_nowait, f"[{record.levelname}] {msg}")
+                    # Only send WARNING and above to Telegram to reduce noise
+                    if record.levelno >= logging.WARNING:
+                        msg = self.format(record)
+                        # Enqueue message in loop thread
+                        self.loop.call_soon_threadsafe(self.queue.put_nowait, f"[{record.levelname}] {msg}")
                 except Exception:
                     pass
 
@@ -2178,6 +2196,10 @@ class EnhancedCouncilBot:
         # Start sender task
         if not self.log_sender_task:
             self.log_sender_task = asyncio.create_task(self._log_sender_loop())
+
+        # Start access update processor
+        if not self.access_update_task:
+            self.access_update_task = asyncio.create_task(self._process_access_updates_loop())
 
     async def _log_sender_loop(self):
         """Background loop to batch logs and send them to Telegram channel"""
@@ -2219,6 +2241,97 @@ class EnhancedCouncilBot:
         """Yield chunks of text under the given limit"""
         for i in range(0, len(text), limit):
             yield text[i:i+limit]
+
+    async def _process_access_updates_loop(self):
+        """Background loop to process access updates in batches"""
+        while True:
+            try:
+                # Process any pending updates every 30 seconds
+                await asyncio.sleep(30)
+                await self._process_access_updates()
+            except asyncio.CancelledError:
+                # Process any remaining updates before shutting down
+                await self._process_access_updates()
+                break
+            except Exception as e:
+                logger.error(f"Error in access update processing loop: {e}")
+                await asyncio.sleep(5)  # Brief pause before retrying
+
+    async def _process_access_updates(self):
+        """Process queued access updates in batch to reduce Google Sheets API calls"""
+        # Get current queue and clear it
+        async with self.access_update_lock:
+            if not self.access_updates_queue:
+                return
+
+            # Take only a very small batch to avoid API quota limits
+            # Process max 3 updates per batch to stay safely within limits
+            MAX_BATCH_SIZE = 3
+            if len(self.access_updates_queue) > MAX_BATCH_SIZE:
+                updates_to_process = self.access_updates_queue[:MAX_BATCH_SIZE]
+                # Keep the rest in the queue for next processing cycle
+                self.access_updates_queue = self.access_updates_queue[MAX_BATCH_SIZE:]
+            else:
+                updates_to_process = self.access_updates_queue[:]
+                self.access_updates_queue.clear()
+
+        if not updates_to_process:
+            return
+
+        try:
+            # Get current sheet data once
+            all_values = self.sheet.get_all_values()
+
+            # Create a mapping of user_id to row index for quick lookup
+            user_to_row = {}
+            for idx, row in enumerate(all_values, start=1):
+                if row and len(row) > 0:
+                    try:
+                        user_id = str(row[0]).strip()
+                        if user_id:
+                            user_to_row[int(user_id)] = idx
+                    except (ValueError, IndexError):
+                        continue
+
+            # Process each update with delay between calls to avoid rate limits
+            success_count = 0
+            for i, (user_id, timestamp) in enumerate(updates_to_process):
+                if user_id in user_to_row:
+                    row_index = user_to_row[user_id]
+                    try:
+                        # Update the cell in column J (index 10)
+                        self.sheet.update_cell(row_index, 10, timestamp)
+                        logger.info(f"Batch updated access time for user {user_id} at {timestamp}")
+                        success_count += 1
+                        # Add delay between API calls to avoid rate limiting
+                        # Except for the last item in the batch
+                        if i < len(updates_to_process) - 1:
+                            await asyncio.sleep(1)  # 1 second delay between writes
+                    except Exception as e:
+                        logger.error(f"Failed to update access time for user {user_id}: {e}")
+                        # Check if it's a quota error and add longer delay if so
+                        if "429" in str(e) or "Quota exceeded" in str(e):
+                            logger.warning(f"Quota exceeded for user {user_id}, adding extended delay")
+                            await asyncio.sleep(5)  # 5 second delay for quota errors
+                        # Re-queue the failed update
+                        async with self.access_update_lock:
+                            self.access_updates_queue.append((user_id, timestamp))
+                else:
+                    logger.warning(f"User {user_id} not found in sheet for access update")
+
+            if updates_to_process:
+                logger.info(f"Processed batch of {len(updates_to_process)} access updates, {success_count} successful")
+
+        except Exception as e:
+            logger.error(f"Error processing access updates batch: {e}")
+            # Check if it's a quota error and add longer delay if so
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                logger.warning(f"Quota exceeded in batch processing, adding extended delay before retry")
+                await asyncio.sleep(5)  # 5 second delay for quota errors
+            # Re-queue all updates on failure
+            async with self.access_update_lock:
+                # Add to front of queue to retry sooner
+                self.access_updates_queue = updates_to_process + self.access_updates_queue
     
     async def sync_group_members_to_sheet(self, context: ContextTypes.DEFAULT_TYPE):
         """Sync group members to sheet - add members who are in group but not in sheet"""
