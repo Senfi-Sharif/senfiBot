@@ -2,11 +2,32 @@
 .env
 .env.local
 .env.production
+.env.*
+!.env.example
+
+# Credentials and local authentication state
+service_account*.json
+credentials*.json
+token*.json
+*.session
+*.session-journal
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state and local backups
+bot.lock
+*.bak
 
 # Database files
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*-wal
+*-shm
 
 # Python
 __pycache__/

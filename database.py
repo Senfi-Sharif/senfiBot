@@ -31,9 +31,16 @@ class Database:
                 role_name TEXT UNIQUE NOT NULL,
                 user_id TEXT NOT NULL,
                 description TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Migrate databases created before roles had an active flag. Keeping old
+        # role rows preserves role_id references used by existing conversations.
+        role_columns = {row[1] for row in cursor.execute('PRAGMA table_info(roles)')}
+        if 'active' not in role_columns:
+            cursor.execute('ALTER TABLE roles ADD COLUMN active INTEGER NOT NULL DEFAULT 1')
         
         # Threads table
         cursor.execute('''
@@ -96,9 +103,9 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Clear existing roles and reset autoincrement
-        cursor.execute('DELETE FROM roles')
-        cursor.execute('DELETE FROM sqlite_sequence WHERE name = "roles"')
+        # Keep role IDs stable because threads store role_id as a foreign key.
+        # Retain inactive rows for old conversation history and replies.
+        cursor.execute('UPDATE roles SET active = 0')
         
         # Insert roles from environment variables
         from config import Config
@@ -121,8 +128,12 @@ class Database:
             actual_user_id = Config.get_role_user_id(user_id_key)
             if actual_user_id:  # Only insert if user ID is configured
                 cursor.execute('''
-                    INSERT INTO roles (role_name, user_id, description)
-                    VALUES (?, ?, ?)
+                    INSERT INTO roles (role_name, user_id, description, active)
+                    VALUES (?, ?, ?, 1)
+                    ON CONFLICT(role_name) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        description = excluded.description,
+                        active = 1
                 ''', (role_name, actual_user_id, description))
         
         conn.commit()
@@ -146,7 +157,7 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('SELECT role_id, role_name, user_id, description FROM roles ORDER BY role_id')
+        cursor.execute('SELECT role_id, role_name, user_id, description FROM roles WHERE active = 1 ORDER BY role_id')
         roles = []
         for row in cursor.fetchall():
             role_id, role_name, user_id, description = row
@@ -168,7 +179,7 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('SELECT role_id, role_name, user_id, description FROM roles WHERE role_id = ?', (role_id,))
+        cursor.execute('SELECT role_id, role_name, user_id, description FROM roles WHERE role_id = ? AND active = 1', (role_id,))
         row = cursor.fetchone()
         
         conn.close()

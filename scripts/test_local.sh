@@ -46,7 +46,7 @@ try:
     print('✅ Database tables created successfully')
     
     # Test role operations
-    roles = db.get_all_roles()
+    roles = db.get_roles()
     print(f'✅ Found {len(roles)} roles in database')
     
 except Exception as e:
@@ -70,7 +70,7 @@ except Exception as e:
 echo "🤖 Testing bot imports..."
 python3 -c "
 try:
-    from enhanced_bot import CouncilBot
+    from enhanced_bot import EnhancedCouncilBot
     print('✅ Bot module imports successfully')
 except Exception as e:
     print('❌ Bot import failed:', e)

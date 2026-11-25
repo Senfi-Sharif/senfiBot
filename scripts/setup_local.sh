@@ -45,8 +45,8 @@ fi
 # Initialize database
 echo "🗄️ Initializing database..."
 python3 -c "
-from database import init_database
-init_database()
+from database import Database
+Database()
 print('Database initialized successfully!')
 "
 

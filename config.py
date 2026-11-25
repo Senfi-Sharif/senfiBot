@@ -24,7 +24,7 @@ class Config:
         'ROLE_WOMEN_USER_ID': os.getenv('ROLE_WOMEN_USER_ID'),                            # کارگروه زنان: نرگس کاری
         'ROLE_NUTRITION_USER_ID': os.getenv('ROLE_NUTRITION_USER_ID'),                    # کارگروه تغذیه: آرین شباهنگ
         'ROLE_HEALTH_USER_ID': os.getenv('ROLE_HEALTH_USER_ID'),                          # کارگروه سلامت: بهاره حیدری
-        'ROLE_FACILITIES_USER_ID': os.getenv('ROLE_FACILITIES_USER_ID'),                  # کارگروه تاسیسات و خدمات رفاهی: سید رضا رضی
+        'ROLE_FACILITIES_USER_ID': os.getenv('ROLE_FACILITIES_USER_ID'),                  # کارگ réfléchir و خدمات رفاهی: سید رضا رضی
         'ROLE_DORMITORY_USER_ID': os.getenv('ROLE_DORMITORY_USER_ID'),                    # کارگروه خوابگاه‌ها: مجید محمدی
         'ROLE_PUBLIC_RELATIONS_USER_ID': os.getenv('ROLE_PUBLIC_RELATIONS_USER_ID'),      # کارگروه روابط عمومی و رویدادها: آرشام برقی
         'ROLE_PUBLICATION_USER_ID': os.getenv('ROLE_PUBLICATION_USER_ID'),                # نشریه
@@ -35,7 +35,7 @@ class Config:
     MAX_MESSAGES_PER_10_MINUTES = 5  # Limit messages per user per 10 minutes per role
     
     # Channel Configuration
-    CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0')) or None
+    CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0') or '0') or None
     
     # Group Configuration
     GROUP_ID = os.getenv('GROUP_ID')  # Group ID for @shora_sharif
@@ -44,6 +44,12 @@ class Config:
     PYROGRAM_API_ID = os.getenv('PYROGRAM_API_ID')
     PYROGRAM_API_HASH = os.getenv('PYROGRAM_API_HASH')
     PYROGRAM_SESSION_NAME = os.getenv('PYROGRAM_SESSION_NAME', 'pyrogram_session')
+
+    # Local path to the Google service-account key. Keep the JSON file out of Git.
+    GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', 'service_account.json')
+    
+    # Google Sheets Configuration
+    SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
     
     @classmethod
     def validate_config(cls):
@@ -61,6 +67,9 @@ class Config:
         if not role_users_configured:
             missing_configs.append('At least one role user ID')
         
+        if not cls.SPREADSHEET_ID:
+            missing_configs.append('SPREADSHEET_ID')
+        
         if missing_configs:
             raise ValueError(f"Missing required configuration: {', '.join(missing_configs)}")
         
@@ -69,4 +78,4 @@ class Config:
     @classmethod
     def get_role_user_id(cls, role_user_key: str) -> str:
         """Get the actual user ID for a role"""
-        return cls.ROLE_USERS.get(role_user_key) 
+        return cls.ROLE_USERS.get(role_user_key)

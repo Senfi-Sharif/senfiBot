@@ -15,7 +15,7 @@ from telegram.ext import (
     ContextTypes, filters, ConversationHandler
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 
 from database import Database
 from config import Config
@@ -263,11 +263,11 @@ class EnhancedCouncilBot:
                 "https://www.googleapis.com/auth/drive"
             ]
             creds = Credentials.from_service_account_file(
-                "service_account.json",
+                Config.GOOGLE_SERVICE_ACCOUNT_FILE,
                 scopes=SCOPES
             )
             client = gspread.authorize(creds)
-            self.sheet = client.open_by_key("1S0qznFEtw31fhaGXNOsggg0nGvM6g74Rp3A8PVwGFsI").sheet1
+            self.sheet = client.open_by_key(Config.SPREADSHEET_ID).sheet1
             logger.info("Google Sheets connection initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing Google Sheets: {e}")
@@ -1633,8 +1633,34 @@ class EnhancedCouncilBot:
                 write_timeout=30,
                 connect_timeout=10
             )
+            # getUpdates has its own transport; configure it separately from the
+            # regular Bot API request transport above.
+            get_updates_request = HTTPXRequest(
+                connection_pool_size=1,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=10
+            )
             
-            application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).request(request).build()
+            application = (
+                Application.builder()
+                .token(Config.TELEGRAM_BOT_TOKEN)
+                .request(request)
+                .get_updates_request(get_updates_request)
+                .build()
+            )
+
+            async def handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+                error = context.error
+                if isinstance(error, NetworkError):
+                    logger.warning("Telegram network error; polling will retry: %s", error)
+                    return
+                logger.error(
+                    "Unhandled Telegram application error",
+                    exc_info=(type(error), error, error.__traceback__) if error else None,
+                )
+
+            application.add_error_handler(handle_application_error)
             
             # Add conversation handler
             conv_handler = ConversationHandler(
@@ -2800,12 +2826,18 @@ class EnhancedCouncilBot:
         
         logger.info(f"✅ handle_group_message: Processing message from chat {chat_id}")
         
+        user = update.effective_user
+        # Anonymous admins and sender-chat messages have no effective user ID.
+        # They cannot be checked against the per-user sheet permissions.
+        if user is None:
+            logger.info("Skipping group message without an effective user")
+            return
+
         # Skip bot messages
-        if update.effective_user.is_bot:
+        if user.is_bot:
             logger.info("⏭️ handle_group_message: Skipping bot message")
             return
         
-        user = update.effective_user
         user_id = user.id
         username = user.username or "no_username"
         first_name = user.first_name or "no_name"
