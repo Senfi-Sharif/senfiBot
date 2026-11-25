@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TelegramError
+from telegram.helpers import escape_markdown
 
 from database import Database
 from config import Config
@@ -701,17 +702,20 @@ class EnhancedCouncilBot:
         # Create admin notification message
         username = update.effective_user.username
         username_display = f"@{username}" if username else "بدون نام کاربری"
+        markdown_username = escape_markdown(username_display, version=1)
+        markdown_first_name = escape_markdown(update.effective_user.first_name or 'بدون نام', version=1)
+        markdown_message_text = escape_markdown(message_text, version=1)
         
         admin_message = f"""
 📨 **پیام جدید از دانشجو**
 
 👤 **اطلاعات دانشجو:**
 🆔 شناسه: `{update.effective_user.id}`
-👤 نام: {update.effective_user.first_name or 'بدون نام'}
-📝 نام کاربری: {username_display}
+👤 نام: {markdown_first_name}
+📝 نام کاربری: {markdown_username}
 
 💬 **پیام:**
-{message_text}
+{markdown_message_text}
 
 🆔 **شناسه گفتگو:** #{thread_id}
 
